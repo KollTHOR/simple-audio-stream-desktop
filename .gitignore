@@ -1,6 +1,9 @@
 # Rust build artifacts
 /target/
 
+# OpenCode session dump (tool state, not project content)
+session.json
+
 # Editor/OS cruft
 *.swp
 .DS_Store

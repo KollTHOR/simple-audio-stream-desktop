@@ -115,17 +115,59 @@ fn run_aoa(args: Vec<String>) {
     };
 
     // Reuse the exact node-side negotiation proven at M0, now over the real pipe.
+    // Reads run on a helper thread so a silent device cannot hang the CLI forever: the first
+    // HELLO/CAPABILITIES must arrive within --wait seconds (default 12) or we print diagnostics.
+    let wait_secs: u64 = parse_flag(&args, "--wait")
+        .and_then(|s| s.parse().ok())
+        .unwrap_or(12);
+    eprintln!(
+        "AOA pipe open. Waiting for device HELLO/CAPABILITIES (keep the app open on the phone)..."
+    );
+    let (tx, rx) = std::sync::mpsc::channel::<Result<aslc::receiver::Inbound, String>>();
+    std::thread::spawn(move || {
+        let mut reader = InboundReader::new(reader);
+        loop {
+            match reader.next_inbound() {
+                Ok(Some(m)) => {
+                    if tx.send(Ok(m)).is_err() {
+                        return; // main thread gone
+                    }
+                }
+                Ok(None) => {
+                    let _ = tx.send(Err("device closed the pipe (EOF)".into()));
+                    return;
+                }
+                Err(e) => {
+                    let _ = tx.send(Err(e.to_string()));
+                    return;
+                }
+            }
+        }
+    });
     let mut outbound = FrameWriter::new(writer);
-    let mut inbound = InboundReader::new(reader);
     let mut recv = Receiver::new();
     let mut seq: u32 = 0;
     let fmt_target;
 
     loop {
-        let msg = match inbound.next_inbound().expect("inbound io") {
-            Some(m) => m,
-            None => {
-                eprintln!("device closed the pipe before negotiation completed");
+        let msg = match rx.recv_timeout(std::time::Duration::from_secs(wait_secs)) {
+            Ok(Ok(m)) => m,
+            Ok(Err(e)) => {
+                eprintln!("inbound error: {e}");
+                std::process::exit(1);
+            }
+            Err(std::sync::mpsc::RecvTimeoutError::Timeout) => {
+                eprintln!(
+                    "no frames from the device after {wait_secs}s.\n\
+                     The bulk pipe is open, but nothing on the device has opened the accessory yet:\n\
+                     - the Android USB-input feature must be running and hold the accessory\n\
+                     - check the phone's USB Input card / app logs (accessory permission prompt?)\n\
+                     exiting."
+                );
+                std::process::exit(1);
+            }
+            Err(std::sync::mpsc::RecvTimeoutError::Disconnected) => {
+                eprintln!("reader thread ended unexpectedly");
                 std::process::exit(1);
             }
         };
@@ -159,11 +201,43 @@ fn run_aoa(args: Vec<String>) {
     }
 
     let fmt = fmt_target;
-    println!("streaming synthetic PCM (~2s)...");
+    let tone = args.iter().any(|a| a == "--tone");
+    let seconds: u64 = parse_flag(&args, "--for")
+        .and_then(|s| s.parse().ok())
+        .unwrap_or(2);
+    println!(
+        "streaming {} PCM for ~{}s...",
+        if tone { "440 Hz tone" } else { "silence" },
+        seconds
+    );
     let frames_per_msg = fmt.sample_rate / 100; // 10 ms
-    let pcm = vec![0x00u8; fmt.bytes_per_frame() * frames_per_msg as usize];
+    let mut phase = 0f64;
+    let mut pcm = vec![0u8; fmt.bytes_per_frame() * frames_per_msg as usize];
     let start = std::time::Instant::now();
-    while start.elapsed() < std::time::Duration::from_secs(2) {
+    while start.elapsed() < std::time::Duration::from_secs(seconds) {
+        if tone {
+            // Continuous-phase sine so chunks don't click; keep mono-duplicated into both channels.
+            for f in 0..frames_per_msg as usize {
+                let s = ((2.0 * std::f64::consts::PI * 440.0 * (phase + f as f64)
+                    / fmt.sample_rate as f64)
+                    .sin()
+                    * 0.3) as i16;
+                for c in 0..fmt.channels as usize {
+                    let off = (f * fmt.channels as usize + c) * fmt.bytes_per_sample();
+                    match fmt.bytes_per_sample() {
+                        2 => pcm[off..off + 2].copy_from_slice(&s.to_le_bytes()),
+                        // 24-bit packed: place in high 3 bytes of an i32 pattern; 32-bit: i32 LE.
+                        3 => {
+                            let v = (s as i32) << 8;
+                            pcm[off..off + 3].copy_from_slice(&v.to_le_bytes()[..3]);
+                        }
+                        4 => pcm[off..off + 4].copy_from_slice(&((s as i32) << 16).to_le_bytes()),
+                        _ => {}
+                    }
+                }
+            }
+            phase += frames_per_msg as f64;
+        }
         let mut payload = vec![0u8; PCM_FRAME_COUNT_SIZE + pcm.len()];
         payload[..PCM_FRAME_COUNT_SIZE].copy_from_slice(&frames_per_msg.to_be_bytes());
         payload[PCM_FRAME_COUNT_SIZE..].copy_from_slice(&pcm);

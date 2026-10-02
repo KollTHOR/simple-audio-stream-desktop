@@ -33,12 +33,15 @@ pub const AOA_GET_PROTOCOL: u8 = 51;
 pub const AOA_SEND_STRING: u8 = 52;
 pub const AOA_START_ACCESSORY: u8 = 53;
 
-/// wIndex selectors for AOA_SEND_STRING (order is fixed by the protocol).
+/// wIndex selectors for AOA_SEND_STRING (order is fixed by the protocol). VERIFIED against the
+/// Android kernel's slot mapping: 3=VERSION, 4=URI, 5=SERIAL. (Putting anything in URI makes the
+/// framework launch the SystemUI accessory-URI chooser instead of dispatching a clean attach.)
 pub const AOA_STRING_MANUFACTURER: u16 = 0;
 pub const AOA_STRING_MODEL: u16 = 1;
 pub const AOA_STRING_DESCRIPTION: u16 = 2;
-pub const AOA_STRING_SERIAL: u16 = 3;
-pub const AOA_STRING_VERSION: u16 = 4;
+pub const AOA_STRING_VERSION: u16 = 3;
+pub const AOA_STRING_URI: u16 = 4;
+pub const AOA_STRING_SERIAL: u16 = 5;
 
 /// Google's USB VID. In accessory mode the phone re-enumerates with this VID and a 0x2Dxx product id.
 pub const GOOGLE_VID: u16 = 0x18d1;
@@ -48,12 +51,14 @@ pub const ACCESSORY_PID_AOA2: u16 = 0x2d04;
 pub const ACCESSORY_PID_AOA2_AUDIO: u16 = 0x2d05;
 
 /// AOA identify strings this host presents. Android's `accessory_filter.xml` is permissive today, so
-/// these are informational; pin them there to auto-launch only for ASLC nodes.
+/// these are informational; pin them there to auto-launch only for ASLC nodes. URI MUST stay empty:
+/// a non-empty URI makes Android launch the SystemUI accessory-URI chooser instead of a clean attach.
 pub const AOA_MANUFACTURER: &str = "Simple Audio Stream";
 pub const AOA_MODEL: &str = "ASLC Node";
 pub const AOA_DESCRIPTION: &str = "ASLC PCM input source";
-pub const AOA_SERIAL: &str = "1";
 pub const AOA_VERSION: &str = "1.0";
+pub const AOA_URI: &str = "";
+pub const AOA_SERIAL: &str = "1";
 
 pub fn is_accessory_pid(pid: u16) -> bool {
     matches!(
@@ -95,31 +100,34 @@ fn io_other(msg: impl Into<String>) -> AslcError {
 
 // ---- Interface / endpoint discovery --------------------------------------------------------
 
-/// Claim an interface exposing one bulk-IN and one bulk-OUT endpoint. Tries low interface numbers
-/// (the AOA interface is almost always 0). Returns (interface, in_addr, out_addr).
+/// Claim the AOA data interface of an accessory-mode device. The Android accessory gadget always
+/// exposes it as **interface 0**; anything else (e.g. the ADB interface, which also has bulk
+/// endpoints!) would be the wrong pipe, so we claim exactly 0 and fail with guidance otherwise.
 fn discover_bulk_interface(dev: &Device) -> Result<(Interface, u8, u8), AslcError> {
-    for interface_number in 0..=4u8 {
-        let iface = match dev.detach_and_claim_interface(interface_number) {
-            Ok(i) => i,
-            Err(_) => continue, // busy/absent; try next
-        };
-        let mut in_ep = None;
-        let mut out_ep = None;
-        for alt in iface.descriptors() {
-            for ep in alt.endpoints() {
-                if ep.transfer_type() == EndpointType::Bulk {
-                    match ep.direction() {
-                        Direction::In => in_ep = Some(ep.address()),
-                        Direction::Out => out_ep = Some(ep.address()),
-                    }
+    let iface = dev.detach_and_claim_interface(0).map_err(|e| {
+        io_other(format!(
+            "accessory data interface 0 not claimable ({e}) - on Windows install the WinUSB \
+             driver: pnputil /add-driver platform\\winusb\\aslc_aoa.inf /install"
+        ))
+    })?;
+    let mut in_ep = None;
+    let mut out_ep = None;
+    for alt in iface.descriptors() {
+        for ep in alt.endpoints() {
+            if ep.transfer_type() == EndpointType::Bulk {
+                match ep.direction() {
+                    Direction::In => in_ep = Some(ep.address()),
+                    Direction::Out => out_ep = Some(ep.address()),
                 }
             }
         }
-        if let (Some(in_addr), Some(out_addr)) = (in_ep, out_ep) {
-            return Ok((iface, in_addr, out_addr));
-        }
     }
-    Err(io_other("no bulk IN/OUT interface found on accessory"))
+    match (in_ep, out_ep) {
+        (Some(i), Some(o)) => Ok((iface, i, o)),
+        _ => Err(io_other(
+            "interface 0 has no bulk IN/OUT pair - not an AOA data interface",
+        )),
+    }
 }
 
 // ---- Byte-pipe adapters over bulk endpoints ------------------------------------------------
@@ -178,8 +186,9 @@ impl AoaTransport {
             (AOA_STRING_MANUFACTURER, AOA_MANUFACTURER),
             (AOA_STRING_MODEL, AOA_MODEL),
             (AOA_STRING_DESCRIPTION, AOA_DESCRIPTION),
-            (AOA_STRING_SERIAL, AOA_SERIAL),
             (AOA_STRING_VERSION, AOA_VERSION),
+            (AOA_STRING_URI, AOA_URI),
+            (AOA_STRING_SERIAL, AOA_SERIAL),
         ] {
             iface
                 .control_out_blocking(
@@ -200,11 +209,20 @@ impl AoaTransport {
     }
 
     /// Waits for the phone to re-enumerate as an accessory after START, then opens + claims its bulk
-    /// interface.
+    /// interface. Windows PnP can take several seconds to settle a re-enumerated composite, so this
+    /// polls patiently and reports progress.
     fn wait_for_accessory(&mut self) -> Result<(Interface, u8, u8), AslcError> {
-        let deadline = Instant::now() + Duration::from_millis(2500);
+        let deadline = Instant::now() + Duration::from_secs(20);
+        let mut announced = false;
         loop {
             if let Some(dev) = Self::find_device(is_accessory_device) {
+                if !announced {
+                    eprintln!(
+                        "accessory present ({}), opening...",
+                        accessory_pid_name(dev.product_id()).unwrap_or("?")
+                    );
+                    announced = true;
+                }
                 match dev.open() {
                     Ok(device) => {
                         return discover_bulk_interface(&device);
@@ -233,11 +251,32 @@ impl Transport for AoaTransport {
             let device = dev
                 .open()
                 .map_err(|e| io_other(format!("open pre-handshake device: {e}")))?;
-            // On Windows this interface must already be WinUSB-bound (see README / Zadig note).
-            let iface = device
-                .detach_and_claim_interface(0)
-                .map_err(|e| io_other(format!("claim pre-handshake interface 0 (WinUSB?): {e}")))?;
-            let _version = Self::do_handshake(&iface)?;
+            // Claim the FIRST interface we can: on Windows only WinUSB-bound interfaces are
+            // claimable, so on an MTP+ADB composite this lands on the ADB interface (bound to
+            // WINUSB by the system driver), giving us a handle for the device-directed AOA
+            // control transfers. Interface 0 (MTP) is owned by WPD and will fail, which is fine.
+            let mut claimed: Option<Interface> = None;
+            let mut claim_errs = Vec::new();
+            for n in 0..=6u8 {
+                match device.detach_and_claim_interface(n) {
+                    Ok(i) => {
+                        claimed = Some(i);
+                        break;
+                    }
+                    Err(e) => claim_errs.push(format!("if{n}: {e}")),
+                }
+            }
+            let iface = claimed.ok_or_else(|| {
+                io_other(format!(
+                    "no WinUSB-bound interface to claim -> {}",
+                    claim_errs.join(" | ")
+                ))
+            })?;
+            let version = Self::do_handshake(&iface)?;
+            eprintln!(
+                "AOA handshake accepted (device protocol v{version}); waiting for accessory..."
+            );
+            drop(iface);
             drop(device); // accessory re-enumerates under a new device node
         }
 
@@ -351,6 +390,13 @@ mod tests {
                 "bad AOA string {s:?}"
             );
         }
+        // Non-empty URI hijacks attach dispatch into the SystemUI URI chooser (verified on M300).
+        assert!(AOA_URI.is_empty(), "URI slot must stay empty");
+        // Kernel string-slot mapping must not drift: 3=version, 4=uri, 5=serial.
+        assert_eq!(
+            (AOA_STRING_VERSION, AOA_STRING_URI, AOA_STRING_SERIAL),
+            (3, 4, 5)
+        );
     }
 
     #[test]

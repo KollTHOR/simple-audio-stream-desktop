@@ -21,9 +21,15 @@ Implemented and tested (on Linux, no hardware):
   `io::Read`/`io::Write` adapters over the bulk pipe — behind the *same* `Transport` trait, so the M0
   protocol code is unchanged. `list-usb` + `aoa` subcommands are wired.
 
-Awaiting a physically-cabled phone (Windows bring-up):
-- The actual open→handshake→bulk I/O against a real device + the WinUSB driver binding (see below).
-- End-to-end `aslc_node aoa --vid … --pid …` streaming into the Android nightly.
+Verified on real hardware (HiBy M300, Windows, 2026-10-02):
+- AOA v2 works on the M300: `GET_PROTOCOL` answered v2, `START` flipped the gadget to accessory
+  mode (`18D1:2D01`, persists across replug) from the desktop node.
+- Bulk pipe opened: after binding WinUSB to the accessory interface (Zadig; see M1 notes below)
+  the node claims interface 0 and the pipe is live.
+- Stands at the last boundary: the **Android app must be running and hold the accessory**
+  (`openAccessory` + accessory permission). The nightly on the device (b169) has no path to obtain
+  that grant (its manifest filter is on the service, which broadcasts cannot start; there is no
+  permission-request flow) — a device-app-side decision, tracked in the Android repo, not done here.
 
 Remaining roadmap:
 - **M2** WASAPI loopback capture (`cpal`) → convert/resample → paced `PCM_DATA` streaming.
@@ -44,28 +50,42 @@ cargo fmt --check
 Requires a stable Rust toolchain (1.75+). M1 pulls `nusb` (WinUSB on Windows / usbfs on Linux) +
 `futures-lite`; the M0 protocol core stays dependency-free.
 
-## M1 bring-up on Windows (device test checklist)
+## M1 bring-up on Windows
 
-1. Install Rust: `winget install Rustlang.Rustup`, plus **VS Build Tools** with the
-   *"Desktop development with C++"* workload (Rust links against MSVC).
+1. Toolchain: `winget install Rustlang.Rustup` + VS Build Tools 2022 with the *"Desktop development
+   with C++"* workload (Rust links against MSVC).
 2. `git clone https://github.com/KollTHOR/simple-audio-stream-desktop.git && cargo build`.
-3. Phone: enable **Developer options** + USB debugging; set USB mode to charging / "no data"; install
-   and open the **Android USB nightly** (it must be foregrounded on the Diagnostics/USB screen so you
-   can see state without `adb`).
-4. `aslc_node list-usb` — on Windows a device only appears once a **WinUSB** driver is bound to it.
-   Modern Windows usually auto-binds WinUSB for AOA devices (MS OS 2.0 descriptors). If the phone
-   (or its pre-handshake interface) is absent, run **Zadig** and install WinUSB for it.
-5. Identify the phone's `VID:PID` (pre-handshake) from `list-usb`, then:
-   `aslc_node aoa --vid 18d1 --pid <pid>` (or `--accessory` if it already enumerated as an accessory).
-   Watch the Android **USB Input card** go Connected → configured → Receiving, and the Diagnostics
-   **"USB"** section counters.
+3. Cable the phone, run `aslc_node list-usb` — it shows what nusb can see (on Windows that requires
+   a WinUSB-bound interface; see requirements below).
+4. Run `aslc_node aoa --vid 18d1 --pid <pid>` — or `--accessory` when the phone already enumerates
+   in accessory mode (it stays there across replug once the handshake ran).
 
-### The one real M1 risk
-The AOA handshake is *vendor control transfers to the phone's normal (MTP/PTP) interface before it
-flips to accessory mode*. Windows won't bind WinUSB to that interface by default, so a one-time Zadig
-driver swap on the phone's pre-handshake `VID:PID` is often required to open a handle and send
-`GET_PROTOCOL`. The accessory interface (`0x18D1:0x2D00`) itself usually gets WinUSB automatically.
-Code path is identical on both OSes; only this driver step is Windows-specific.
+### M1 driver requirements (Windows), learned the hard way
+- **The AOA handshake needs *any* WinUSB-bound interface on the phone to open a handle**
+  (device-directed vendor control transfers go through a claimed interface on Windows; the
+  device-level blocking control nusb offers isn't supported on Windows). In File-transfer/MTP mode
+  the only interface is WPD-owned and the claim fails — that wall is real and was hit.
+  For bring-up, USB debugging was enabled once: Windows auto-binds WinUSB to the ADB interface, and
+  the node performed the handshake through it. **A production installer should bind WinUSB to the
+  phone's pre-handshake interface itself (signed device INF) so end users never touch Developer
+  options** — see `platform/winusb/aslc_aoa.inf` for the accessory half and the same pattern for it.
+- **The M300 publishes no MS OS descriptors for the accessory data interface (MI_00)** — Windows
+  leaves it unbound ("Error" in Device Manager) and nusb cannot claim it. Bind it once with
+  **Zadig → WinUSB** (per machine). `platform/winusb/aslc_aoa.inf` carries the matching rules and
+  documents the production path (pnputil rejects unsigned third-party INFs; a signed Inf2Cat
+  catalog is required). Devices that do ship AOA MS OS descriptors need no INF at all.
+
+### The last boundary before first audio
+Everything up to the pipe is verified; the pipe then waits on the **device-side app**: it must be
+running and hold the accessory (`openAccessory`) before it answers HELLO/CAPABILITIES. Nightly
+b169 has no way to get there without developer tooling (its USB service can't be started by the
+ACCESSORY_ATTACHED broadcast on modern Android, and no accessory-permission request flow exists).
+That is an Android-repo decision, deliberately *not* worked around from this side.
+
+### Useful CLI for bring-up
+`aslc_node aoa --vid 18d1 --pid <pid> [--accessory] [--tone] [--for <s>] [--wait <s>]`
+— `--tone` streams a 440 Hz sine in the negotiated geometry, `--for` sets duration,
+`--wait` bounds the inbound wait so a silent device prints diagnostics instead of hanging.
 
 ## Shared protocol
 

@@ -1,0 +1,51 @@
+; aslc_aoa.inf — binds the in-box WinUSB driver to the Android AOA accessory
+; data interface (MI_00 of the accessory-mode composite, Google VID 0x18D1).
+;
+; Needed because HiBy-style devices don't ship MS OS 2.0 descriptors for the
+; accessory function, so Windows leaves it unbound and libusb/nusb cannot claim it.
+;
+; Install (elevated):
+;   pnputil /add-driver aslc_aoa.inf /install
+;
+; VERIFIED 2026-10-02 on the HiBy M300: pnputil REJECTS this INF locally ("third-party INF does
+; not contain digital signature information") because a driver package needs an Inf2Cat-generated
+; catalog signed by a real code-signing certificate. Local bring-up used Zadig (same WinUSB bind)
+; instead. Production: build the catalog with the WDK Inf2Cat during packaging and sign it with the
+; project's EV cert, then this INF + .cat installs silently via pnputil from the companion's setup.
+; Note some Android devices publish MS OS 2.0 descriptors for their AOA interface and need no INF
+; at all (Windows binds WinUSB automatically); the M300 does not, hence this file.
+
+[Version]
+Signature   = "$WINDOWS NT$"
+Class       = USB
+ClassGuid   = {36fc9e60-c465-11cf-8056-444553540000}
+Provider    = %ProviderName%
+DriverVer   = 10/02/2026,1.0.0.0
+
+[Manufacturer]
+%ProviderName% = Standard, NTamd64
+
+[Standard.NTamd64]
+%AoaDataDesc% = WinUsb_Install, USB\VID_18D1&PID_2D00&MI_00
+%AoaDataDesc% = WinUsb_Install, USB\VID_18D1&PID_2D01&MI_00
+%AoaDataDesc% = WinUsb_Install, USB\VID_18D1&PID_2D04&MI_00
+%AoaDataDesc% = WinUsb_Install, USB\VID_18D1&PID_2D05&MI_00
+
+[WinUsb_Install]
+Include = winusb.inf
+Needs   = WINUSB.NT
+
+[WinUsb_Install.Services]
+Include = winusb.inf
+Needs   = WINUSB.NT.Services
+
+[WinUsb_Install.HW]
+AddReg  = WinUsb_Install.HW.AddReg
+
+[WinUsb_Install.HW.AddReg]
+; Device interface GUID our node opens; stable for ASLC.
+HKR,,DeviceInterfaceGUIDs,0x10000,"{4a2f0b1c-7f5d-4e22-9b34-0b6c2f1d5a77}"
+
+[Strings]
+ProviderName = "Simple Audio Stream"
+AoaDataDesc  = "ASLC AOA Data Interface"

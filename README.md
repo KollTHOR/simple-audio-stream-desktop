@@ -11,16 +11,23 @@ Windows/Linux (this node)  --USB / AOA (host->accessory)-->  Android  -->  outpu
 
 ## Status: Milestone 0 (hardware-free protocol core)
 
-Implemented and tested:
+Implemented and tested (on Linux, no hardware):
 - `aslc` framing + control-plane codecs — **byte-for-byte** the Android wire format, locked by
   golden-vector conformance tests.
-- TCP transport (dev/test byte pipe).
+- TCP transport (dev/test byte pipe) implementing the `Transport` trait.
 - Negotiation state machine (the host side) + a localhost end-to-end self-test.
+- **M1** AOA host transport (`src/aoa.rs`) over `nusb`: device enumeration, the AOA control handshake
+  (`GET_PROTOCOL`/`SEND_STRING×5`/`START`), accessory-mode re-enumeration, bulk-endpoint discovery, and
+  `io::Read`/`io::Write` adapters over the bulk pipe — behind the *same* `Transport` trait, so the M0
+  protocol code is unchanged. `list-usb` + `aoa` subcommands are wired.
 
-Not yet (roadmap):
-- **M1** AOA host transport over `nusb` (+ WinUSB driver notes). USB-level handshake, not part of ASLC.
+Awaiting a physically-cabled phone (Windows bring-up):
+- The actual open→handshake→bulk I/O against a real device + the WinUSB driver binding (see below).
+- End-to-end `aslc_node aoa --vid … --pid …` streaming into the Android nightly.
+
+Remaining roadmap:
 - **M2** WASAPI loopback capture (`cpal`) → convert/resample → paced `PCM_DATA` streaming.
-- **M3** hot-plug recovery, backpressure, stats, CLI UX.
+- **M3** hot-plug recovery, backpressure, stats, CLI polish.
 - **M4** GUI.
 
 ## Build & test
@@ -29,11 +36,36 @@ Not yet (roadmap):
 cargo build
 cargo test            # unit + golden-vector conformance
 cargo run -- selftest # end-to-end negotiation+stream over a local loopback (no hardware)
+cargo run -- list-usb # enumerate USB devices (find your phone's VID:PID)
 cargo clippy --all-targets -- -D warnings
 cargo fmt --check
 ```
 
-Requires only a stable Rust toolchain (1.75+). The M0 core is dependency-free (std only).
+Requires a stable Rust toolchain (1.75+). M1 pulls `nusb` (WinUSB on Windows / usbfs on Linux) +
+`futures-lite`; the M0 protocol core stays dependency-free.
+
+## M1 bring-up on Windows (device test checklist)
+
+1. Install Rust: `winget install Rustlang.Rustup`, plus **VS Build Tools** with the
+   *"Desktop development with C++"* workload (Rust links against MSVC).
+2. `git clone https://github.com/KollTHOR/simple-audio-stream-desktop.git && cargo build`.
+3. Phone: enable **Developer options** + USB debugging; set USB mode to charging / "no data"; install
+   and open the **Android USB nightly** (it must be foregrounded on the Diagnostics/USB screen so you
+   can see state without `adb`).
+4. `aslc_node list-usb` — on Windows a device only appears once a **WinUSB** driver is bound to it.
+   Modern Windows usually auto-binds WinUSB for AOA devices (MS OS 2.0 descriptors). If the phone
+   (or its pre-handshake interface) is absent, run **Zadig** and install WinUSB for it.
+5. Identify the phone's `VID:PID` (pre-handshake) from `list-usb`, then:
+   `aslc_node aoa --vid 18d1 --pid <pid>` (or `--accessory` if it already enumerated as an accessory).
+   Watch the Android **USB Input card** go Connected → configured → Receiving, and the Diagnostics
+   **"USB"** section counters.
+
+### The one real M1 risk
+The AOA handshake is *vendor control transfers to the phone's normal (MTP/PTP) interface before it
+flips to accessory mode*. Windows won't bind WinUSB to that interface by default, so a one-time Zadig
+driver swap on the phone's pre-handshake `VID:PID` is often required to open a handle and send
+`GET_PROTOCOL`. The accessory interface (`0x18D1:0x2D00`) itself usually gets WinUSB automatically.
+Code path is identical on both OSes; only this driver step is Windows-specific.
 
 ## Shared protocol
 

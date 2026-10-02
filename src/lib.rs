@@ -11,6 +11,7 @@
 //! - [`payload`] — control-plane payload codecs (HELLO/CAPABILITIES/CONFIGURE/...).
 //! - [`transport`] — an ordered byte pipe abstraction (TCP now, AOA later).
 
+pub mod aoa;
 pub mod capabilities;
 pub mod format;
 pub mod frame;
@@ -18,6 +19,7 @@ pub mod payload;
 pub mod receiver;
 pub mod transport;
 
+pub use aoa::AoaTransport;
 pub use capabilities::PcmCapabilities;
 pub use format::{PcmFormat, ENCODING_PCM};
 pub use frame::{
@@ -25,3 +27,4 @@ pub use frame::{
 };
 pub use payload::{Hello, PcmError};
 pub use receiver::Receiver;
+pub use transport::{Halves, TcpTransport, Transport};

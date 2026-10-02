@@ -25,11 +25,160 @@ fn main() {
     match args.next().as_deref() {
         None | Some("selftest") => run_selftest(),
         Some("version") => println!("aslc_node 0.1.0 (protocol v{PROTOCOL_VERSION})"),
+        Some("list-usb") => list_usb(),
+        Some("aoa") => run_aoa(args.collect::<Vec<_>>()),
         Some(other) => {
-            eprintln!("unknown command: {other}\nusage: aslc_node [selftest|version]");
+            eprintln!("unknown command: {other}\nusage: aslc_node [selftest|list-usb|aoa [--vid V --pid P|--accessory]|version]");
             std::process::exit(2);
         }
     }
+}
+
+/// Enumerate USB devices visible to nusb and show how to identify the target phone. On Windows a
+/// device only appears here once a WinUSB driver is bound to it (Zadig / MS OS descriptors); on
+/// Linux all devices are listed but bulk I/O may need a udev rule / root.
+fn list_usb() {
+    match nusb::list_devices() {
+        Err(e) => {
+            eprintln!("could not enumerate USB devices: {e}");
+            std::process::exit(1);
+        }
+        Ok(devs) => {
+            let mut n = 0usize;
+            println!(
+                "{:<4} {:9} {:6} {:>4}  note",
+                "idx", "VID:PID", "class", "spd"
+            );
+            for d in devs {
+                let note = if aslc::aoa::is_accessory_device(&d) {
+                    format!(
+                        "<= AOA accessory ({})",
+                        aslc::aoa::accessory_pid_name(d.product_id()).unwrap_or("?")
+                    )
+                } else if d.vendor_id() == aslc::aoa::GOOGLE_VID {
+                    "Google device (maybe pre-handshake phone)".to_string()
+                } else {
+                    String::new()
+                };
+                println!(
+                    "{:<4} {:04x}:{:04x}  {:>4}  {:?}  {}",
+                    n,
+                    d.vendor_id(),
+                    d.product_id(),
+                    format!("{:02x}", d.class()),
+                    d.speed(),
+                    note
+                );
+                n += 1;
+            }
+            if n == 0 {
+                println!("(no devices — on Windows, bind WinUSB to the phone first)");
+            }
+        }
+    }
+}
+
+fn parse_flag(args: &[String], name: &str) -> Option<String> {
+    args.windows(2).find(|w| w[0] == name).map(|w| w[1].clone())
+}
+
+/// Drives a real ASLC negotiation + short PCM burst over the AOA pipe. Requires the phone cabled and
+/// the Android receiver app (USB nightly) running. Without a device it prints guidance and exits 1.
+fn run_aoa(args: Vec<String>) {
+    use aslc::transport::Transport;
+
+    let mut transport = if args.iter().any(|a| a == "--accessory") {
+        aslc::AoaTransport::from_attached_accessory()
+    } else {
+        let vid = parse_flag(&args, "--vid")
+            .and_then(|s| u16::from_str_radix(s.trim_start_matches("0x"), 16).ok());
+        let pid = parse_flag(&args, "--pid")
+            .and_then(|s| u16::from_str_radix(s.trim_start_matches("0x"), 16).ok());
+        match (vid, pid) {
+            (Some(v), Some(p)) => aslc::AoaTransport::new(v, p),
+            _ => {
+                eprintln!("usage: aslc_node aoa --vid <hex> --pid <hex>   (or --accessory)");
+                eprintln!("find the phone's VID:PID with `aslc_node list-usb`");
+                std::process::exit(2);
+            }
+        }
+    };
+
+    println!("opening AOA pipe...");
+    let (reader, writer) = match transport.open() {
+        Ok(h) => h,
+        Err(e) => {
+            eprintln!("AOA open failed: {e}");
+            eprintln!("Checklist: phone in accessory mode? WinUSB bound (Windows)? Android USB nightly running?");
+            std::process::exit(1);
+        }
+    };
+
+    // Reuse the exact node-side negotiation proven at M0, now over the real pipe.
+    let mut outbound = FrameWriter::new(writer);
+    let mut inbound = InboundReader::new(reader);
+    let mut recv = Receiver::new();
+    let mut seq: u32 = 0;
+    let fmt_target;
+
+    loop {
+        let msg = match inbound.next_inbound().expect("inbound io") {
+            Some(m) => m,
+            None => {
+                eprintln!("device closed the pipe before negotiation completed");
+                std::process::exit(1);
+            }
+        };
+        if let Some(step) = recv.handle(&msg) {
+            match step {
+                Negotiation::Ready(_caps, fmt) => {
+                    println!("got capabilities; requesting {}", fmt.display_label());
+                    let payload = configure_payload(fmt);
+                    outbound
+                        .write_frame(MSG_CONFIGURE, &payload, 0, payload.len(), seq)
+                        .unwrap();
+                    seq += 1;
+                }
+                Negotiation::Accepted(ack) => {
+                    println!("CONFIGURE_ACK: {}", ack.display_label());
+                    outbound.write_frame(MSG_START, &[], 0, 0, seq).unwrap();
+                    seq += 1;
+                    fmt_target = ack;
+                    break;
+                }
+                Negotiation::Rejected(err) => {
+                    eprintln!(
+                        "rejected: {} — {}",
+                        aslc::frame::describe_error_code(err.error_code),
+                        err.message
+                    );
+                    std::process::exit(1);
+                }
+            }
+        }
+    }
+
+    let fmt = fmt_target;
+    println!("streaming synthetic PCM (~2s)...");
+    let frames_per_msg = fmt.sample_rate / 100; // 10 ms
+    let pcm = vec![0x00u8; fmt.bytes_per_frame() * frames_per_msg as usize];
+    let start = std::time::Instant::now();
+    while start.elapsed() < std::time::Duration::from_secs(2) {
+        let mut payload = vec![0u8; PCM_FRAME_COUNT_SIZE + pcm.len()];
+        payload[..PCM_FRAME_COUNT_SIZE].copy_from_slice(&frames_per_msg.to_be_bytes());
+        payload[PCM_FRAME_COUNT_SIZE..].copy_from_slice(&pcm);
+        outbound
+            .write_frame(MSG_PCM_DATA, &payload, 0, payload.len(), seq)
+            .unwrap();
+        seq += 1;
+        std::thread::sleep(std::time::Duration::from_millis(10));
+    }
+    outbound.write_frame(MSG_STOP, &[], 0, 0, seq).unwrap();
+    transport.close();
+    println!(
+        "done: sent {} PCM messages over AOA; check the Android USB Input card / Diagnostics.",
+        seq.saturating_sub(1)
+    );
 }
 
 fn run_selftest() {

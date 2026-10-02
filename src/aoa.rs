@@ -1,0 +1,361 @@
+//! Android Open Accessory (AOA) host transport — the real USB byte pipe for ASLC (spec §1, M1).
+//!
+//! Orientation: the **desktop is the USB host**, the **phone is the accessory**. The desktop talks to
+//! the phone with raw USB control + bulk transfers via `nusb` (WinUSB on Windows, native usbfs on
+//! Linux). Once the AOA handshake flips the phone into accessory mode it exposes two bulk endpoints
+//! that form the ordered byte pipe ASLC frames ride.
+//!
+//! This module owns ONLY the transport/handshake. ASLC framing/negotiation lives in
+//! `frame`/`payload`/`receiver` and runs on top of the pipe, so the code proven over TCP at M0 is
+//! unchanged here — nothing above the [`Transport`] trait changed (spec §13).
+//!
+//! Everything compiles on Linux; the actual open/handshake/bulk paths need a physically-cabled phone
+//! and run at Windows test time. Pure helpers (handshake byte shape, PID classification) are tested
+//! on any host.
+
+use std::io::{Read, Write};
+use std::time::{Duration, Instant};
+
+use futures_lite::future::block_on;
+use nusb::transfer::{Control, ControlType, Direction, EndpointType, Recipient, RequestBuffer};
+use nusb::{Device, DeviceInfo, Interface};
+
+use crate::frame::AslcError;
+use crate::transport::{Halves, Transport};
+
+/// Max bytes requested per bulk-IN packet read. Bulk packets larger than this are carried over.
+const MAX_BULK_READ: usize = 16 * 1024;
+
+// ---- AOA protocol constants (shared contract for the host side) ----------------------------
+
+/// Vendor control request codes (host -> device, recipient Device), per the AOA spec.
+pub const AOA_GET_PROTOCOL: u8 = 51;
+pub const AOA_SEND_STRING: u8 = 52;
+pub const AOA_START_ACCESSORY: u8 = 53;
+
+/// wIndex selectors for AOA_SEND_STRING (order is fixed by the protocol).
+pub const AOA_STRING_MANUFACTURER: u16 = 0;
+pub const AOA_STRING_MODEL: u16 = 1;
+pub const AOA_STRING_DESCRIPTION: u16 = 2;
+pub const AOA_STRING_SERIAL: u16 = 3;
+pub const AOA_STRING_VERSION: u16 = 4;
+
+/// Google's USB VID. In accessory mode the phone re-enumerates with this VID and a 0x2Dxx product id.
+pub const GOOGLE_VID: u16 = 0x18d1;
+pub const ACCESSORY_PID_AOA1: u16 = 0x2d00;
+pub const ACCESSORY_PID_AOA1_AUDIO: u16 = 0x2d01;
+pub const ACCESSORY_PID_AOA2: u16 = 0x2d04;
+pub const ACCESSORY_PID_AOA2_AUDIO: u16 = 0x2d05;
+
+/// AOA identify strings this host presents. Android's `accessory_filter.xml` is permissive today, so
+/// these are informational; pin them there to auto-launch only for ASLC nodes.
+pub const AOA_MANUFACTURER: &str = "Simple Audio Stream";
+pub const AOA_MODEL: &str = "ASLC Node";
+pub const AOA_DESCRIPTION: &str = "ASLC PCM input source";
+pub const AOA_SERIAL: &str = "1";
+pub const AOA_VERSION: &str = "1.0";
+
+pub fn is_accessory_pid(pid: u16) -> bool {
+    matches!(
+        pid,
+        ACCESSORY_PID_AOA1
+            | ACCESSORY_PID_AOA1_AUDIO
+            | ACCESSORY_PID_AOA2
+            | ACCESSORY_PID_AOA2_AUDIO
+    )
+}
+
+pub fn accessory_pid_name(pid: u16) -> Option<&'static str> {
+    Some(match pid {
+        ACCESSORY_PID_AOA1 => "AOA1",
+        ACCESSORY_PID_AOA1_AUDIO => "AOA1+audio",
+        ACCESSORY_PID_AOA2 => "AOA2",
+        ACCESSORY_PID_AOA2_AUDIO => "AOA2+audio",
+        _ => return None,
+    })
+}
+
+pub fn is_accessory_device(dev: &DeviceInfo) -> bool {
+    dev.vendor_id() == GOOGLE_VID && is_accessory_pid(dev.product_id())
+}
+
+fn vendor_dev(request: u8, value: u16, index: u16) -> Control {
+    Control {
+        control_type: ControlType::Vendor,
+        recipient: Recipient::Device,
+        request,
+        value,
+        index,
+    }
+}
+
+fn io_other(msg: impl Into<String>) -> AslcError {
+    AslcError::Io(std::io::Error::other(msg.into()))
+}
+
+// ---- Interface / endpoint discovery --------------------------------------------------------
+
+/// Claim an interface exposing one bulk-IN and one bulk-OUT endpoint. Tries low interface numbers
+/// (the AOA interface is almost always 0). Returns (interface, in_addr, out_addr).
+fn discover_bulk_interface(dev: &Device) -> Result<(Interface, u8, u8), AslcError> {
+    for interface_number in 0..=4u8 {
+        let iface = match dev.detach_and_claim_interface(interface_number) {
+            Ok(i) => i,
+            Err(_) => continue, // busy/absent; try next
+        };
+        let mut in_ep = None;
+        let mut out_ep = None;
+        for alt in iface.descriptors() {
+            for ep in alt.endpoints() {
+                if ep.transfer_type() == EndpointType::Bulk {
+                    match ep.direction() {
+                        Direction::In => in_ep = Some(ep.address()),
+                        Direction::Out => out_ep = Some(ep.address()),
+                    }
+                }
+            }
+        }
+        if let (Some(in_addr), Some(out_addr)) = (in_ep, out_ep) {
+            return Ok((iface, in_addr, out_addr));
+        }
+    }
+    Err(io_other("no bulk IN/OUT interface found on accessory"))
+}
+
+// ---- Byte-pipe adapters over bulk endpoints ------------------------------------------------
+
+/// A `Transport` over an AOA accessory. Opening performs the full handshake if needed.
+pub struct AoaTransport {
+    /// The phone's VID:PID as it enumerates *before* handshake (to select + switch it). Ignored when
+    /// the device is already in accessory mode.
+    pre_handshake: Option<(u16, u16)>,
+    /// Holds the claimed accessory interface so it stays alive while the halves use it (Interface is
+    /// Arc-backed; the halves clone it, this keeps a reference so the claim survives `open` returning).
+    keepalive: Option<Interface>,
+}
+
+impl AoaTransport {
+    /// Target the device at `vid:pid` (pre-handshake) and switch it into accessory mode. Use
+    /// `aslc_node list-usb` to discover that VID:PID on the target machine.
+    pub fn new(vid: u16, pid: u16) -> Self {
+        Self {
+            pre_handshake: Some((vid, pid)),
+            keepalive: None,
+        }
+    }
+
+    /// Attach to a device already in accessory mode (no handshake).
+    pub fn from_attached_accessory() -> Self {
+        Self {
+            pre_handshake: None,
+            keepalive: None,
+        }
+    }
+
+    fn find_device(pred: impl Fn(&DeviceInfo) -> bool) -> Option<DeviceInfo> {
+        nusb::list_devices().ok()?.find(pred)
+    }
+
+    /// Runs the AOA control handshake on a claimed interface of the pre-handshake device. Returns the
+    /// device's AOA protocol version.
+    fn do_handshake(iface: &Interface) -> Result<u16, AslcError> {
+        let mut proto = [0u8; 2];
+        let got = iface
+            .control_in_blocking(
+                vendor_dev(AOA_GET_PROTOCOL, 0, 0),
+                &mut proto,
+                Duration::from_millis(500),
+            )
+            .map_err(|e| io_other(format!("GET_PROTOCOL failed: {e}")))?;
+        if got < 2 {
+            return Err(io_other("GET_PROTOCOL returned short reply"));
+        }
+        let version = u16::from_le_bytes(proto);
+        if version < 1 {
+            return Err(io_other(format!("device AOA protocol too old: {version}")));
+        }
+        for (idx, s) in [
+            (AOA_STRING_MANUFACTURER, AOA_MANUFACTURER),
+            (AOA_STRING_MODEL, AOA_MODEL),
+            (AOA_STRING_DESCRIPTION, AOA_DESCRIPTION),
+            (AOA_STRING_SERIAL, AOA_SERIAL),
+            (AOA_STRING_VERSION, AOA_VERSION),
+        ] {
+            iface
+                .control_out_blocking(
+                    vendor_dev(AOA_SEND_STRING, 0, idx),
+                    s.as_bytes(),
+                    Duration::from_millis(500),
+                )
+                .map_err(|e| io_other(format!("SEND_STRING({idx}) failed: {e}")))?;
+        }
+        iface
+            .control_out_blocking(
+                vendor_dev(AOA_START_ACCESSORY, 0, 0),
+                &[],
+                Duration::from_millis(500),
+            )
+            .map_err(|e| io_other(format!("START_ACCESSORY failed: {e}")))?;
+        Ok(version)
+    }
+
+    /// Waits for the phone to re-enumerate as an accessory after START, then opens + claims its bulk
+    /// interface.
+    fn wait_for_accessory(&mut self) -> Result<(Interface, u8, u8), AslcError> {
+        let deadline = Instant::now() + Duration::from_millis(2500);
+        loop {
+            if let Some(dev) = Self::find_device(is_accessory_device) {
+                match dev.open() {
+                    Ok(device) => {
+                        return discover_bulk_interface(&device);
+                    }
+                    // open() can transiently fail mid re-enumeration; keep polling until the deadline.
+                    Err(_) if Instant::now() < deadline => {}
+                    Err(e) => return Err(io_other(format!("accessory open failed: {e}"))),
+                }
+            }
+            if Instant::now() >= deadline {
+                return Err(io_other("timed out waiting for accessory mode"));
+            }
+            std::thread::sleep(Duration::from_millis(100));
+        }
+    }
+}
+
+impl Transport for AoaTransport {
+    fn open(&mut self) -> Result<Halves, AslcError> {
+        // Case B (pre-handshake): switch the target phone into accessory mode first.
+        if let Some((vid, pid)) = self.pre_handshake {
+            let dev = Self::find_device(|d| d.vendor_id() == vid && d.product_id() == pid)
+                .ok_or_else(|| {
+                    io_other(format!("target device {vid:04x}:{pid:04x} not present"))
+                })?;
+            let device = dev
+                .open()
+                .map_err(|e| io_other(format!("open pre-handshake device: {e}")))?;
+            // On Windows this interface must already be WinUSB-bound (see README / Zadig note).
+            let iface = device
+                .detach_and_claim_interface(0)
+                .map_err(|e| io_other(format!("claim pre-handshake interface 0 (WinUSB?): {e}")))?;
+            let _version = Self::do_handshake(&iface)?;
+            drop(device); // accessory re-enumerates under a new device node
+        }
+
+        // Case A/B: attach to the accessory and hand back bulk halves.
+        let (iface, in_ep, out_ep) = self.wait_for_accessory()?;
+        self.keepalive = Some(iface.clone());
+        Ok((
+            Box::new(BulkReader {
+                iface: iface.clone(),
+                in_ep,
+                carry: Vec::new(),
+            }),
+            Box::new(BulkWriter { iface, out_ep }),
+        ))
+    }
+
+    fn close(&mut self) {
+        self.keepalive = None;
+    }
+}
+
+/// Reader half: reads a bulk-IN packet at a time, buffering any over-read (`carry`) so `io::Read`
+/// partial-fill semantics hold even though delivery is packet-granular.
+struct BulkReader {
+    iface: Interface,
+    in_ep: u8,
+    carry: Vec<u8>,
+}
+
+impl Read for BulkReader {
+    fn read(&mut self, buf: &mut [u8]) -> std::io::Result<usize> {
+        if !self.carry.is_empty() {
+            let n = buf.len().min(self.carry.len());
+            buf[..n].copy_from_slice(&self.carry[..n]);
+            self.carry.drain(..n);
+            return Ok(n);
+        }
+        if buf.is_empty() {
+            return Ok(0);
+        }
+        let rb = RequestBuffer::new(MAX_BULK_READ);
+        let data = block_on(self.iface.bulk_in(self.in_ep, rb))
+            .into_result()
+            .map_err(io_to_std)?;
+        let n = buf.len().min(data.len());
+        buf[..n].copy_from_slice(&data[..n]);
+        if data.len() > n {
+            self.carry.extend_from_slice(&data[n..]);
+        }
+        Ok(n)
+    }
+}
+
+/// Writer half: one bulk-OUT transfer per write; `write_all` loops until the whole slice is sent.
+struct BulkWriter {
+    iface: Interface,
+    out_ep: u8,
+}
+
+impl Write for BulkWriter {
+    fn write(&mut self, buf: &[u8]) -> std::io::Result<usize> {
+        let data = buf.to_vec();
+        block_on(self.iface.bulk_out(self.out_ep, data))
+            .into_result()
+            .map_err(io_to_std)?;
+        Ok(buf.len())
+    }
+    fn flush(&mut self) -> std::io::Result<()> {
+        Ok(())
+    }
+}
+
+fn io_to_std(e: nusb::transfer::TransferError) -> std::io::Error {
+    std::io::Error::other(e.to_string())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn classifies_accessory_pids() {
+        assert!(is_accessory_pid(ACCESSORY_PID_AOA1));
+        assert!(is_accessory_pid(ACCESSORY_PID_AOA2_AUDIO));
+        assert!(!is_accessory_pid(0x4e20));
+        assert_eq!(accessory_pid_name(ACCESSORY_PID_AOA1), Some("AOA1"));
+        assert_eq!(accessory_pid_name(0x1234), None);
+    }
+
+    #[test]
+    fn vendor_control_shape() {
+        let c = vendor_dev(AOA_GET_PROTOCOL, 0x1122, 3);
+        assert_eq!(c.control_type, ControlType::Vendor);
+        assert_eq!(c.recipient, Recipient::Device);
+        assert_eq!(c.request, 51);
+        assert_eq!(c.value, 0x1122);
+        assert_eq!(c.index, 3);
+    }
+
+    #[test]
+    fn handshake_strings_are_valid_ascii_and_bounded() {
+        for s in [
+            AOA_MANUFACTURER,
+            AOA_MODEL,
+            AOA_DESCRIPTION,
+            AOA_SERIAL,
+            AOA_VERSION,
+        ] {
+            assert!(
+                s.is_ascii() && !s.is_empty() && s.len() < 64,
+                "bad AOA string {s:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn list_devices_is_safe_without_a_phone() {
+        // Enumeration must not panic with no accessory present; any device count is fine.
+        let _ = nusb::list_devices().map(|it| it.count()).unwrap_or(0);
+    }
+}

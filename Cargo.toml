@@ -21,3 +21,7 @@ path = "src/lib.rs"
 [profile.release]
 opt-level = 3
 lto = "thin"
+
+[dependencies]
+futures-lite = "2"
+nusb = "0.1.14"

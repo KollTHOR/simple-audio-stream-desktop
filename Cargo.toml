@@ -1,0 +1,23 @@
+[package]
+name = "aslc_node"
+version = "0.1.0"
+edition = "2021"
+rust-version = "1.75"
+description = "ASLC desktop node: USB (AOA) PCM source for the Simple Audio Stream Android receiver. Windows + Linux core."
+license = "MIT"
+
+# M0 is deliberately dependency-free (std only) so the protocol/framing core
+# builds and tests offline on any host. The USB (nusb) and audio (cpal) crates
+# are added at M1/M2 and will be target-gated.
+
+[[bin]]
+name = "aslc_node"
+path = "src/bin/aslc_node.rs"
+
+[lib]
+name = "aslc"
+path = "src/lib.rs"
+
+[profile.release]
+opt-level = 3
+lto = "thin"

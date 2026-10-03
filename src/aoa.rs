@@ -84,6 +84,126 @@ pub fn is_accessory_device(dev: &DeviceInfo) -> bool {
     dev.vendor_id() == GOOGLE_VID && is_accessory_pid(dev.product_id())
 }
 
+// ---- Read-only capability probe (no START, no mode switch) ----------------------------------
+
+/// One interface's probe outcome: claimable? bulk pair? (claim errors carry the OS reason).
+#[derive(Debug, Clone)]
+pub struct IfProbe {
+    pub number: u8,
+    pub claimable: bool,
+    pub bulk_in: Option<u8>,
+    pub bulk_out: Option<u8>,
+    pub note: String,
+}
+
+/// Capability report for one connected device. `aoa_protocol: Some(v)` means the firmware's
+/// accessory gadget RESPONDED to GET_PROTOCOL (AOA v1/v2 capable); None = no reply/STALL or no
+/// claimable interface to ask through.
+#[derive(Debug, Clone)]
+pub struct ProbeReport {
+    pub vid: u16,
+    pub pid: u16,
+    pub aoa_protocol: Option<u16>,
+    pub proto_error: String,
+    pub interfaces: Vec<IfProbe>,
+}
+
+impl ProbeReport {
+    pub fn summary(&self) -> String {
+        match self.aoa_protocol {
+            Some(v) => format!("AOA capable: protocol v{v}"),
+            None if self.proto_error.is_empty() => {
+                "AOA probe inconclusive (no claimable interface to ask through)".into()
+            }
+            None => format!("AOA not answering: {}", self.proto_error),
+        }
+    }
+}
+
+/// Pick a probe target: any 18d1 device, preferring one already in accessory mode.
+pub fn find_probe_target() -> Option<(u16, u16)> {
+    let mut first = None;
+    for d in nusb::list_devices().ok()? {
+        if d.vendor_id() != GOOGLE_VID {
+            continue;
+        }
+        if is_accessory_pid(d.product_id()) {
+            return Some((d.vendor_id(), d.product_id()));
+        }
+        first.get_or_insert((d.vendor_id(), d.product_id()));
+    }
+    first
+}
+
+/// Non-destructive capability probe: open the device, try claiming each low interface number,
+/// and — through the first claimable interface with a bulk pair — send `GET_PROTOCOL` only.
+/// Does NOT send the strings/START, so the device stays in its current USB mode.
+pub fn probe_device(vid: u16, pid: u16) -> Result<ProbeReport, AslcError> {
+    let dev = AoaTransport::find_device(|d| d.vendor_id() == vid && d.product_id() == pid)
+        .ok_or_else(|| io_other(format!("device {vid:04x}:{pid:04x} not present")))?;
+    let device = dev.open().map_err(|e| {
+        io_other(format!(
+            "open failed: {e} (on Windows the device needs a WinUSB binding)"
+        ))
+    })?;
+    let mut report = ProbeReport {
+        vid,
+        pid,
+        aoa_protocol: None,
+        proto_error: String::new(),
+        interfaces: Vec::new(),
+    };
+    let mut ask_through: Option<Interface> = None;
+    for n in 0..=5u8 {
+        match device.detach_and_claim_interface(n) {
+            Ok(iface) => {
+                let mut b_in = None;
+                let mut b_out = None;
+                for alt in iface.descriptors() {
+                    for ep in alt.endpoints() {
+                        if ep.transfer_type() == EndpointType::Bulk {
+                            match ep.direction() {
+                                Direction::In => b_in = Some(ep.address()),
+                                Direction::Out => b_out = Some(ep.address()),
+                            }
+                        }
+                    }
+                }
+                report.interfaces.push(IfProbe {
+                    number: n,
+                    claimable: true,
+                    bulk_in: b_in,
+                    bulk_out: b_out,
+                    note: String::new(),
+                });
+                if b_in.is_some() && b_out.is_some() && ask_through.is_none() {
+                    ask_through = Some(iface); // keep it claimed while we ask
+                }
+            }
+            Err(e) => report.interfaces.push(IfProbe {
+                number: n,
+                claimable: false,
+                bulk_in: None,
+                bulk_out: None,
+                note: e.to_string(),
+            }),
+        }
+    }
+    if let Some(iface) = &ask_through {
+        let mut buf = [0u8; 2];
+        match iface.control_in_blocking(
+            vendor_dev(AOA_GET_PROTOCOL, 0, 0),
+            &mut buf,
+            Duration::from_millis(500),
+        ) {
+            Ok(got) if got >= 2 => report.aoa_protocol = Some(u16::from_le_bytes(buf)),
+            Ok(_) => report.proto_error = "short reply".into(),
+            Err(e) => report.proto_error = e.to_string(),
+        }
+    }
+    Ok(report)
+}
+
 fn vendor_dev(request: u8, value: u16, index: u16) -> Control {
     Control {
         control_type: ControlType::Vendor,

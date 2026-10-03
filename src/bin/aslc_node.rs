@@ -26,6 +26,7 @@ fn main() {
         None | Some("selftest") => run_selftest(),
         Some("version") => println!("aslc_node 0.1.0 (protocol v{PROTOCOL_VERSION})"),
         Some("list-usb") => list_usb(),
+        Some("probe") => run_probe(args.collect::<Vec<_>>()),
         Some("aoa") => run_aoa(args.collect::<Vec<_>>()),
         Some(other) => {
             eprintln!("unknown command: {other}\nusage: aslc_node [selftest|list-usb|aoa [--vid V --pid P|--accessory]|version]");
@@ -84,6 +85,55 @@ fn parse_flag(args: &[String], name: &str) -> Option<String> {
 
 /// Drives a real ASLC negotiation + short PCM burst over the AOA pipe. Requires the phone cabled and
 /// the Android receiver app (USB nightly) running. Without a device it prints guidance and exits 1.
+fn parse_hex(s: &str) -> Option<u16> {
+    u16::from_str_radix(s.trim_start_matches("0x").trim_start_matches("0X"), 16).ok()
+}
+
+/// Read-only capability probe of the connected device: enumerates claimable interfaces and asks
+/// GET_PROTOCOL through one — no strings, no START, so the device does NOT leave its USB mode.
+fn run_probe(args: Vec<String>) {
+    let vid = parse_flag(&args, "--vid").and_then(|s| parse_hex(&s));
+    let pid = parse_flag(&args, "--pid").and_then(|s| parse_hex(&s));
+    let (v, p) = match (vid, pid) {
+        (Some(v), Some(p)) => (v, p),
+        _ => aslc::aoa::find_probe_target().unwrap_or_else(|| {
+            eprintln!("no Android (18d1) device found — plug the phone in or pass --vid/--pid");
+            std::process::exit(1);
+        }),
+    };
+    println!("probing {v:04x}:{p:04x} (read-only, no mode switch)...");
+    match aslc::aoa::probe_device(v, p) {
+        Ok(rep) => {
+            println!("  AOA capability: {}", rep.summary());
+            for i in rep.interfaces.iter().filter(|i| i.claimable) {
+                println!(
+                    "  iface {}: claimable, bulk in={} out={}",
+                    i.number,
+                    i.bulk_in
+                        .map(|a| format!("{a:#04x}"))
+                        .unwrap_or_else(|| "-".into()),
+                    i.bulk_out
+                        .map(|a| format!("{a:#04x}"))
+                        .unwrap_or_else(|| "-".into()),
+                );
+            }
+            let blocked: Vec<String> = rep
+                .interfaces
+                .iter()
+                .filter(|i| !i.claimable)
+                .map(|i| format!("iface {}: {}", i.number, i.note))
+                .collect();
+            if !blocked.is_empty() {
+                println!("  not claimable: {}", blocked.join(" | "));
+            }
+        }
+        Err(e) => {
+            eprintln!("probe failed: {e}");
+            std::process::exit(1);
+        }
+    }
+}
+
 fn run_aoa(args: Vec<String>) {
     use aslc::transport::Transport;
 

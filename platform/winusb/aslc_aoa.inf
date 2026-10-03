@@ -1,51 +1,75 @@
-; aslc_aoa.inf — binds the in-box WinUSB driver to the Android AOA accessory
-; data interface (MI_00 of the accessory-mode composite, Google VID 0x18D1).
+; ============================================================================
+; ASLC Node WinUSB device package — installs Microsoft's in-box WinUSB driver
+; onto the USB interfaces the ASLC desktop node talks to (no vendor binaries).
 ;
-; Needed because HiBy-style devices don't ship MS OS 2.0 descriptors for the
-; accessory function, so Windows leaves it unbound and libusb/nusb cannot claim it.
+; Sections (by hardware ID):
+;   [PreHandshake]   the phone's normal gadget door (HiBy M300 in file-transfer
+;                    mode: 18d1:4EE1). Binding this replaces the WPD/MTP driver
+;                    for that device ON THIS PC ONLY (other PCs unaffected);
+;                    uninstalling or rolling back restores MTP. Deliberately
+;                    does NOT include 4EE2 (the mtp+adb composite) so enabling
+;                    USB debugging still gives adb its own interface untouched.
+;   [Accessory]      the standardized Android AOA accessory interfaces
+;                    (18d1:2D00/2D01/2D04/2D05, data iface = MI_00 when the
+;                    accessory composite also carries audio/adb functions).
 ;
-; Install (elevated):
-;   pnputil /add-driver aslc_aoa.inf /install
-;
-; VERIFIED 2026-10-02 on the HiBy M300: pnputil REJECTS this INF locally ("third-party INF does
-; not contain digital signature information") because a driver package needs an Inf2Cat-generated
-; catalog signed by a real code-signing certificate. Local bring-up used Zadig (same WinUSB bind)
-; instead. Production: build the catalog with the WDK Inf2Cat during packaging and sign it with the
-; project's EV cert, then this INF + .cat installs silently via pnputil from the companion's setup.
-; Note some Android devices publish MS OS 2.0 descriptors for their AOA interface and need no INF
-; at all (Windows binds WinUSB automatically); the M300 does not, hence this file.
+; App side opens the device through the fixed DeviceInterfaceGUID below.
+; ============================================================================
 
 [Version]
 Signature   = "$WINDOWS NT$"
 Class       = USB
 ClassGuid   = {36fc9e60-c465-11cf-8056-444553540000}
 Provider    = %ProviderName%
-DriverVer   = 10/02/2026,1.0.0.0
+CatalogFile = aslc_aoa.cat
+DriverVer   = 10/03/2026,1.0.0.0
+PnpLockdown = 1
 
 [Manufacturer]
-%ProviderName% = Standard, NTamd64
+%ProviderName% = Standard, NTamd64.10.0...17763
 
-[Standard.NTamd64]
-%AoaDataDesc% = WinUsb_Install, USB\VID_18D1&PID_2D00&MI_00
-%AoaDataDesc% = WinUsb_Install, USB\VID_18D1&PID_2D01&MI_00
-%AoaDataDesc% = WinUsb_Install, USB\VID_18D1&PID_2D04&MI_00
-%AoaDataDesc% = WinUsb_Install, USB\VID_18D1&PID_2D05&MI_00
+[Standard.NTamd64.10.0...17763]
+; ---- pre-handshake door: tested device IDs only ----
+%PreHandshake.DeviceDesc% = ASLC_PreHandshake_Install, USB\VID_18D1&PID_4EE1
+%PreHandshake.DeviceDesc% = ASLC_PreHandshake_Install, USB\VID_18D1&PID_4EE1&MI_00
+; Xiaomi 15 (2717:FF40) intentionally NOT included until its AOA support is
+; confirmed; append its IDs to this section when validated.
 
-[WinUsb_Install]
+; ---- AOA accessory data interface (standardized Google PIDs) ----
+%Accessory.DeviceDesc% = ASLC_Accessory_Install, USB\VID_18D1&PID_2D00
+%Accessory.DeviceDesc% = ASLC_Accessory_Install, USB\VID_18D1&PID_2D01
+%Accessory.DeviceDesc% = ASLC_Accessory_Install, USB\VID_18D1&PID_2D04
+%Accessory.DeviceDesc% = ASLC_Accessory_Install, USB\VID_18D1&PID_2D05
+%Accessory.DeviceDesc% = ASLC_Accessory_Install, USB\VID_18D1&PID_2D00&MI_00
+%Accessory.DeviceDesc% = ASLC_Accessory_Install, USB\VID_18D1&PID_2D01&MI_00
+%Accessory.DeviceDesc% = ASLC_Accessory_Install, USB\VID_18D1&PID_2D04&MI_00
+%Accessory.DeviceDesc% = ASLC_Accessory_Install, USB\VID_18D1&PID_2D05&MI_00
+
+; ----------------------------------------------------------------------------
+
+[ASLC_PreHandshake_Install]
 Include = winusb.inf
 Needs   = WINUSB.NT
 
-[WinUsb_Install.Services]
+[ASLC_PreHandshake_Install.Services]
 Include = winusb.inf
+AddReg  = ASLC_Guid.AddReg
 Needs   = WINUSB.NT.Services
 
-[WinUsb_Install.HW]
-AddReg  = WinUsb_Install.HW.AddReg
+[ASLC_Accessory_Install]
+Include = winusb.inf
+Needs   = WINUSB.NT
 
-[WinUsb_Install.HW.AddReg]
-; Device interface GUID our node opens; stable for ASLC.
+[ASLC_Accessory_Install.Services]
+Include = winusb.inf
+AddReg  = ASLC_Guid.AddReg
+Needs   = WINUSB.NT.Services
+
+; The stable GUID the desktop app enumerates by. Never change it.
+[ASLC_Guid.AddReg]
 HKR,,DeviceInterfaceGUIDs,0x10000,"{4a2f0b1c-7f5d-4e22-9b34-0b6c2f1d5a77}"
 
 [Strings]
-ProviderName = "Simple Audio Stream"
-AoaDataDesc  = "ASLC AOA Data Interface"
+ProviderName            = "ASLC Node (self-signed dev package)"
+PreHandshake.DeviceDesc = "ASLC Phone USB Door"
+Accessory.DeviceDesc    = "ASLC AOA Accessory Data Interface"

@@ -29,18 +29,20 @@ PnpLockdown = 1
 %ProviderName% = Standard, NTamd64.10.0...17763
 
 [Standard.NTamd64.10.0...17763]
-; ---- pre-handshake door: tested device IDs only ----
+; ---- pre-handshake door ----
+; M300 in file-transfer mode is a single-function (non-composite) node -> bare ID is correct.
 %PreHandshake.DeviceDesc% = ASLC_PreHandshake_Install, USB\VID_18D1&PID_4EE1
 %PreHandshake.DeviceDesc% = ASLC_PreHandshake_Install, USB\VID_18D1&PID_4EE1&MI_00
 ; Xiaomi 15 (2717:FF40) intentionally NOT included until its AOA support is
 ; confirmed; append its IDs to this section when validated.
 
-; ---- AOA accessory data interface (standardized Google PIDs) ----
+; ---- AOA accessory data interface ----
+; IMPORTANT: match the MI_00 CHILD of composites (2D01/2D04/2D05 carry adb/audio
+; siblings). Binding the bare PARENT would take the whole composite away from
+; usbccgp and silently kill adb/audio sibling functions - do NOT add bare parent
+; IDs for composite configurations. 2D00 (accessory only, single function) is
+; bare-legit.
 %Accessory.DeviceDesc% = ASLC_Accessory_Install, USB\VID_18D1&PID_2D00
-%Accessory.DeviceDesc% = ASLC_Accessory_Install, USB\VID_18D1&PID_2D01
-%Accessory.DeviceDesc% = ASLC_Accessory_Install, USB\VID_18D1&PID_2D04
-%Accessory.DeviceDesc% = ASLC_Accessory_Install, USB\VID_18D1&PID_2D05
-%Accessory.DeviceDesc% = ASLC_Accessory_Install, USB\VID_18D1&PID_2D00&MI_00
 %Accessory.DeviceDesc% = ASLC_Accessory_Install, USB\VID_18D1&PID_2D01&MI_00
 %Accessory.DeviceDesc% = ASLC_Accessory_Install, USB\VID_18D1&PID_2D04&MI_00
 %Accessory.DeviceDesc% = ASLC_Accessory_Install, USB\VID_18D1&PID_2D05&MI_00

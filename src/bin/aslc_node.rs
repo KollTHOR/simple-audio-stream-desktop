@@ -268,10 +268,7 @@ fn run_aoa(args: Vec<String>) {
         if tone {
             // Continuous-phase sine so chunks don't click; keep mono-duplicated into both channels.
             for f in 0..frames_per_msg as usize {
-                let s = ((2.0 * std::f64::consts::PI * 440.0 * (phase + f as f64)
-                    / fmt.sample_rate as f64)
-                    .sin()
-                    * 0.3) as i16;
+                let s = tone_sample(phase + f as f64, fmt.sample_rate as f64);
                 for c in 0..fmt.channels as usize {
                     let off = (f * fmt.channels as usize + c) * fmt.bytes_per_sample();
                     match fmt.bytes_per_sample() {
@@ -430,4 +427,35 @@ fn run_selftest() {
         dev_frames,
         dev_bytes
     );
+}
+
+/// 440 Hz test tone, ~30% of full scale, continuous phase. NOTE: amplitude must be
+/// scaled to the i16 range *before* the cast - `(sin * 0.3) as i16` truncates every
+/// sample to 0, which is how a "tone" once shipped as pure silence.
+fn tone_sample(phase: f64, sample_rate: f64) -> i16 {
+    (2.0 * std::f64::consts::PI * 440.0 * phase / sample_rate)
+        .sin()
+        .mul_add(0.3 * 32767.0, 0.0)
+        .round() as i16
+}
+
+#[cfg(test)]
+mod tone_tests {
+    use super::tone_sample;
+
+    #[test]
+    fn tone_has_real_amplitude_not_truncated_silence() {
+        // A quarter-period in at 48k should sit near +0.3 FS (~9830), not 0.
+        let quarter = tone_sample(48000.0 / 4.0 / 440.0, 48000.0);
+        assert!(
+            (9000..10500).contains(&quarter),
+            "tone sample too quiet: {quarter}"
+        );
+        let three_quarter = tone_sample(3.0 * 48000.0 / 4.0 / 440.0, 48000.0);
+        assert!(
+            (-10500..-9000).contains(&three_quarter),
+            "tone negative wrong: {three_quarter}"
+        );
+        assert!(tone_sample(0.0, 48000.0).abs() < 2); // zero crossing stays ~0
+    }
 }

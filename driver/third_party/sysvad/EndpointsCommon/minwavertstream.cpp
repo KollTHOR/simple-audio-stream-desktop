@@ -6,6 +6,8 @@
 #include "minwavertstream.h"
 #include "UnittestData.h"
 #include "AudioModuleHelper.h"
+// ASLC: user-mode PCM capture handoff.
+#include "aslc_capture.h"
 #define MINWAVERTSTREAM_POOLTAG 'SRWM'
 
 #pragma warning (disable : 4127)
@@ -431,6 +433,9 @@ Return Value:
             return ntStatus;
         }
     }
+
+    // ASLC: record the negotiated stream format for the user-mode capture handoff.
+    AslcCaptureSetFormat(m_pWfExt, sizeof(WAVEFORMATEXTENSIBLE));
 
     //
     // Register this stream.
@@ -1547,6 +1552,8 @@ ByteDisplacement - # of bytes to process.
     while (ByteDisplacement > 0)
     {
         ULONG runWrite = min(ByteDisplacement, m_ulDmaBufferSize - bufferOffset);
+        // ASLC: hand the newly-rendered run to the user-mode PCM capture ring.
+        AslcCaptureWrite(m_pDmaBuffer + bufferOffset, runWrite);
         m_SaveData.WriteData(m_pDmaBuffer + bufferOffset, runWrite);
         bufferOffset = (bufferOffset + runWrite) % m_ulDmaBufferSize;
         ByteDisplacement -= runWrite;

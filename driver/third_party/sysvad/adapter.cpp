@@ -26,6 +26,8 @@ Abstract:
 
 #include "simple.h"
 #include "minipairs.h"
+// ASLC: kernel/user-mode PCM handoff control device.
+#include "aslc_capture.h"
 #ifdef SYSVAD_BTH_BYPASS
 #include "bthhfpminipairs.h"
 #endif // SYSVAD_BTH_BYPASS
@@ -557,6 +559,11 @@ Return Value:
         ntStatus,
         DPF(D_ERROR, ("WdfDriverCreate failed, 0x%x", ntStatus)),
         Done);
+
+    // ASLC: create the capture control device (\Device\AslcAudio) used to hand rendered
+    // PCM to the user-mode ASLC companion. Best-effort: a capture failure must never
+    // prevent the audio endpoint itself from loading.
+    (VOID)AslcCaptureCreateDevice(DriverObject);
 
     //
     // Get registry configuration.

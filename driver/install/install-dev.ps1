@@ -60,9 +60,16 @@ if ($LASTEXITCODE -ne 0) { throw "signtool failed to sign $cat ($LASTEXITCODE)" 
 $devcon = Get-ChildItem 'C:\Program Files (x86)\Windows Kits\10\Tools' -Recurse -Filter devcon.exe -ErrorAction SilentlyContinue |
           Where-Object { $_.FullName -match '\\x64\\' } | Sort-Object FullName -Descending | Select-Object -First 1 -ExpandProperty FullName
 if (-not $devcon) { throw 'devcon.exe not found' }
-Write-Host "Installing device Root\ASLC via $devcon"
-& $devcon install $inf 'Root\ASLC'
-if ($LASTEXITCODE -ne 0) { throw "devcon install failed ($LASTEXITCODE)" }
+Write-Host "Installing/updating device Root\ASLC via $devcon"
+if (-not (Get-PnpDevice -InstanceId 'ROOT\MEDIA\0001' -ErrorAction SilentlyContinue)) {
+    & $devcon install $inf 'Root\ASLC'
+    if ($LASTEXITCODE -ne 0) { throw "devcon install failed ($LASTEXITCODE)" }
+} else {
+    & $devcon update $inf 'Root\ASLC'
+    if ($LASTEXITCODE -ne 0) { throw "devcon update failed ($LASTEXITCODE)" }
+    # Force a reload so the new .sys is actually in memory.
+    & $devcon restart 'ROOT\MEDIA\0001' | Out-Null
+}
 
 Write-Host ''
 if ($needReboot) {

@@ -62,6 +62,7 @@
     <ClCompile Include="..\third_party\sysvad\EndpointsCommon\speakertopo.cpp" />
     <ClCompile Include="..\third_party\sysvad\EndpointsCommon\AudioModuleHelper.cpp" />
     <ClCompile Include="src\aslc-engine-nodes.cpp" />
+    <ClCompile Include="src\aslc_capture.cpp" />
     <ClCompile Include="..\third_party\sysvad\EndpointsCommon\NewDelete.cpp" />
   </ItemGroup>
 

@@ -15,6 +15,8 @@ pub mod aoa;
 pub mod capabilities;
 pub mod format;
 pub mod frame;
+#[cfg(windows)]
+pub mod audio;
 pub mod payload;
 pub mod receiver;
 pub mod transport;

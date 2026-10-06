@@ -28,6 +28,8 @@ fn main() {
         Some("list-usb") => list_usb(),
         Some("probe") => run_probe(args.collect::<Vec<_>>()),
         Some("aoa") => run_aoa(args.collect::<Vec<_>>()),
+        Some("audio") => run_audio_list(),
+        Some("capture") => run_capture(args.collect::<Vec<_>>()),
         Some(other) => {
             eprintln!("unknown command: {other}\nusage: aslc_node [selftest|list-usb|aoa [--vid V --pid P|--accessory]|version]");
             std::process::exit(2);
@@ -132,6 +134,179 @@ fn run_probe(args: Vec<String>) {
             std::process::exit(1);
         }
     }
+}
+
+// --- Optional WASAPI loopback source (Windows) ---------------------------------------------
+//
+// The node can capture a selected Windows render endpoint via WASAPI loopback and feed the PCM
+// into the ASLC pipeline. No core changes: the source just fills the same PCM buffer the tone
+// would.
+
+#[cfg(windows)]
+type LoopbackSource = aslc::audio::LoopbackSource;
+#[cfg(not(windows))]
+type LoopbackSource = ();
+
+#[cfg(windows)]
+fn open_loopback_source(selector: Option<&str>, mute: bool) -> Option<LoopbackSource> {
+    selector.map(|sel| {
+        aslc::audio::LoopbackSource::open(Some(sel), mute).unwrap_or_else(|e| {
+            eprintln!("loopback unavailable: {e}");
+            std::process::exit(1);
+        })
+    })
+}
+
+#[cfg(not(windows))]
+fn open_loopback_source(selector: Option<&str>, _mute: bool) -> Option<LoopbackSource> {
+    if selector.is_some() {
+        eprintln!("--device (WASAPI loopback) is Windows-only");
+        std::process::exit(1);
+    }
+    None
+}
+
+#[cfg(windows)]
+fn fill_from_loopback(
+    src: &mut Option<LoopbackSource>,
+    fmt: &aslc::PcmFormat,
+    pcm: &mut [u8],
+) -> bool {
+    if let Some(s) = src.as_mut() {
+        s.fill(fmt, pcm);
+        true
+    } else {
+        false
+    }
+}
+
+#[cfg(not(windows))]
+fn fill_from_loopback(
+    _src: &mut Option<LoopbackSource>,
+    _fmt: &aslc::PcmFormat,
+    _pcm: &mut [u8],
+) -> bool {
+    false
+}
+
+#[cfg(windows)]
+fn loopback_is_some(src: &Option<LoopbackSource>) -> bool {
+    src.is_some()
+}
+
+#[cfg(not(windows))]
+fn loopback_is_some(_src: &Option<LoopbackSource>) -> bool {
+    false
+}
+
+#[cfg(windows)]
+fn run_audio_list() {
+    match aslc::audio::list_render_devices() {
+        Ok(devices) => {
+            println!("{:<4} {:<8} {:<34} name", "idx", "default", "format");
+            for d in devices {
+                println!(
+                    "{:<4} {:<8} {:<34} {}",
+                    d.index,
+                    if d.is_default { "yes" } else { "" },
+                    d.format_label(),
+                    d.name
+                );
+            }
+        }
+        Err(e) => {
+            eprintln!("could not enumerate render devices: {e}");
+            std::process::exit(1);
+        }
+    }
+}
+
+#[cfg(not(windows))]
+fn run_audio_list() {
+    eprintln!("audio enumeration is Windows-only");
+    std::process::exit(1);
+}
+
+#[cfg(windows)]
+fn run_capture(args: Vec<String>) {
+    let selector = args.first().cloned();
+    let seconds: u64 = args.get(1).and_then(|s| s.parse().ok()).unwrap_or(10);
+    let out = args
+        .get(2)
+        .cloned()
+        .unwrap_or_else(|| "aslc_capture.wav".to_string());
+    let mute = args.iter().any(|a| a == "--mute");
+
+    let mut src = match aslc::audio::LoopbackSource::open(selector.as_deref(), mute) {
+        Ok(s) => s,
+        Err(e) => {
+            eprintln!("loopback unavailable: {e}");
+            std::process::exit(1);
+        }
+    };
+    let fmt = aslc::PcmFormat::new(src.native_rate(), 16, src.native_channels() as u8);
+    let bpf = fmt.bytes_per_frame();
+    let chunk_frames = (fmt.sample_rate / 100).max(1);
+    let mut buf = vec![0u8; bpf * chunk_frames as usize];
+    let mut pcm: Vec<u8> = Vec::new();
+
+    println!("capturing {} for {seconds}s -> {out}", fmt.display_label());
+    let start = std::time::Instant::now();
+    while start.elapsed() < std::time::Duration::from_secs(seconds) {
+        src.fill(&fmt, &mut buf);
+        pcm.extend_from_slice(&buf);
+        std::thread::sleep(std::time::Duration::from_millis(10));
+    }
+    write_wav(&out, &fmt, &pcm);
+
+    let peak = pcm
+        .chunks_exact(2)
+        .map(|c| i16::from_le_bytes([c[0], c[1]]) as i32)
+        .map(|s| s.abs())
+        .max()
+        .unwrap_or(0);
+    println!(
+        "wrote {} bytes ({:.2}s), peak {peak}/32767",
+        pcm.len(),
+        pcm.len() as f64 / (fmt.sample_rate * fmt.bytes_per_frame() as u32) as f64
+    );
+}
+
+#[cfg(not(windows))]
+fn run_capture(_args: Vec<String>) {
+    eprintln!("capture (WASAPI loopback) is Windows-only");
+    std::process::exit(1);
+}
+
+#[cfg(windows)]
+fn write_wav(path: &str, fmt: &aslc::PcmFormat, pcm: &[u8]) {
+    use std::io::Write as _;
+    let mut f = match std::fs::File::create(path) {
+        Ok(f) => f,
+        Err(e) => {
+            eprintln!("could not create {path}: {e}");
+            return;
+        }
+    };
+    let bits = fmt.bit_depth as u16;
+    let channels = fmt.channels as u16;
+    let sr = fmt.sample_rate;
+    let block_align = channels * bits / 8;
+    let byte_rate = sr * block_align as u32;
+    let data_len = pcm.len() as u32;
+    let _ = f.write_all(b"RIFF");
+    let _ = f.write_all(&(36 + data_len).to_le_bytes());
+    let _ = f.write_all(b"WAVEfmt ");
+    let _ = f.write_all(&16u32.to_le_bytes());
+    let _ = f.write_all(&1u16.to_le_bytes());
+    let _ = f.write_all(&channels.to_le_bytes());
+    let _ = f.write_all(&sr.to_le_bytes());
+    let _ = f.write_all(&byte_rate.to_le_bytes());
+    let _ = f.write_all(&block_align.to_le_bytes());
+    let _ = f.write_all(&bits.to_le_bytes());
+    let _ = f.write_all(b"data");
+    let _ = f.write_all(&data_len.to_le_bytes());
+    let _ = f.write_all(pcm);
 }
 
 fn run_aoa(args: Vec<String>) {
@@ -262,12 +437,24 @@ fn run_aoa(args: Vec<String>) {
 
     let fmt = fmt_target;
     let tone = args.iter().any(|a| a == "--tone");
+    let device = parse_flag(&args, "--device");
+    let mute = args.iter().any(|a| a == "--mute");
     let seconds: u64 = parse_flag(&args, "--for")
         .and_then(|s| s.parse().ok())
         .unwrap_or(2);
+
+    // Optional WASAPI loopback source (Windows): capture a selected render endpoint.
+    let mut loopback = open_loopback_source(device.as_deref(), mute);
+
     println!(
         "streaming {} PCM for ~{}s...",
-        if tone { "440 Hz tone" } else { "silence" },
+        if loopback_is_some(&loopback) {
+            "WASAPI loopback"
+        } else if tone {
+            "440 Hz tone"
+        } else {
+            "silence"
+        },
         seconds
     );
     let frames_per_msg = fmt.sample_rate / 100; // 10 ms
@@ -279,7 +466,7 @@ fn run_aoa(args: Vec<String>) {
     // Android ring starves -> constant underruns + crackle. Deadline pacing holds ~100 msg/s.
     let mut next_send = start;
     while start.elapsed() < std::time::Duration::from_secs(seconds) {
-        if tone {
+        if !fill_from_loopback(&mut loopback, &fmt, &mut pcm) && tone {
             // Continuous-phase sine so chunks don't click; keep mono-duplicated into both channels.
             for f in 0..frames_per_msg as usize {
                 let s = tone_sample(phase + f as f64, fmt.sample_rate as f64);

@@ -264,6 +264,10 @@ fn run_aoa(args: Vec<String>) {
     let mut phase = 0f64;
     let mut pcm = vec![0u8; fmt.bytes_per_frame() * frames_per_msg as usize];
     let start = std::time::Instant::now();
+    // Pace sends to an absolute 10 ms schedule. Sleeping a flat 10 ms *per iteration* adds the
+    // USB write time on top, so the host runs slower than realtime (~87 msg/s observed) and the
+    // Android ring starves -> constant underruns + crackle. Deadline pacing holds ~100 msg/s.
+    let mut next_send = start;
     while start.elapsed() < std::time::Duration::from_secs(seconds) {
         if tone {
             // Continuous-phase sine so chunks don't click; keep mono-duplicated into both channels.
@@ -292,7 +296,13 @@ fn run_aoa(args: Vec<String>) {
             .write_frame(MSG_PCM_DATA, &payload, 0, payload.len(), seq)
             .unwrap();
         seq += 1;
-        std::thread::sleep(std::time::Duration::from_millis(10));
+        next_send += std::time::Duration::from_millis(10);
+        let now = std::time::Instant::now();
+        if next_send > now {
+            std::thread::sleep(next_send - now);
+        } else {
+            next_send = now; // fell behind (slow USB); resume without a catch-up burst
+        }
     }
     outbound.write_frame(MSG_STOP, &[], 0, 0, seq).unwrap();
     transport.close();

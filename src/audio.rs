@@ -133,7 +133,7 @@ pub struct LoopbackSource {
 impl LoopbackSource {
     /// Open a loopback capture on the selected render endpoint. If `mute`, that endpoint is
     /// muted while streaming and restored when the source is dropped.
-    pub fn open(selector: Option<&str>, mute: bool) -> Result<Self, String> {
+    pub fn open(selector: Option<&str>) -> Result<Self, String> {
         let queue = Arc::new(Mutex::new(VecDeque::<f32>::with_capacity(MAX_SAMPLES)));
         let stop = Arc::new(AtomicBool::new(false));
         let (ready_tx, ready_rx) = channel::<Result<(u32, u16, u16, String), String>>();
@@ -142,7 +142,7 @@ impl LoopbackSource {
         let selector = selector.map(|s| s.to_string());
         let thread = std::thread::Builder::new()
             .name("aslc-loopback".into())
-            .spawn(move || capture_thread(selector.as_deref(), mute, q, s, ready_tx))
+            .spawn(move || capture_thread(selector.as_deref(), q, s, ready_tx))
             .map_err(|e| format!("spawn capture thread: {e}"))?;
 
         match ready_rx.recv_timeout(std::time::Duration::from_secs(10)) {
@@ -271,7 +271,6 @@ enum Resample {
 
 fn capture_thread(
     selector: Option<&str>,
-    mute: bool,
     queue: Arc<Mutex<VecDeque<f32>>>,
     stop: Arc<AtomicBool>,
     ready: Sender<Result<(u32, u16, u16, String), String>>,
@@ -332,23 +331,6 @@ fn capture_thread(
         }
     };
 
-    // Optional mute of the selected endpoint while we stream it (restored on stop).
-    let device_id = device.get_id().unwrap_or_default();
-    let prev_mute = if mute {
-        match set_endpoint_mute(&device_id, true) {
-            Ok(prev) => {
-                println!("muted endpoint while streaming (was {prev})");
-                Some(prev)
-            }
-            Err(e) => {
-                eprintln!("warning: could not mute endpoint: {e}");
-                None
-            }
-        }
-    } else {
-        None
-    };
-
     if let Err(e) = client.start_stream() {
         let _ = ready.send(Err(format!("start stream: {e}")));
         return;
@@ -382,10 +364,6 @@ fn capture_thread(
     }
 
     let _ = client.stop_stream();
-    if let Some(prev) = prev_mute {
-        let _ = set_endpoint_mute(&device_id, prev);
-        println!("endpoint mute restored (was {prev})");
-    }
 }
 
 /// Convert a raw mix-format byte run into interleaved f32 samples.
@@ -447,27 +425,5 @@ fn write_sample(fmt: &PcmFormat, out: &mut [u8], frame: usize, ch: usize, v: f32
         32 => out[off..off + 4]
             .copy_from_slice(&((v * 2_147_483_647.0).round() as i32).to_le_bytes()),
         _ => {}
-    }
-}
-
-/// Mute/unmute a render endpoint by its MMDevice id, returning the previous mute state.
-/// Endpoint volume is not exposed by the `wasapi` crate, so we use IAudioEndpointVolume directly.
-fn set_endpoint_mute(device_id: &str, mute: bool) -> Result<bool, String> {
-    use windows::core::{HSTRING, PCWSTR};
-    use windows::Win32::Media::Audio::Endpoints::IAudioEndpointVolume;
-    use windows::Win32::Media::Audio::{IMMDeviceEnumerator, MMDeviceEnumerator};
-    use windows::Win32::System::Com::{CoCreateInstance, CLSCTX_ALL};
-    unsafe {
-        let enumerator: IMMDeviceEnumerator =
-            CoCreateInstance(&MMDeviceEnumerator, None, CLSCTX_ALL).map_err(|e| e.to_string())?;
-        let id = HSTRING::from(device_id);
-        let dev = enumerator
-            .GetDevice(PCWSTR(id.as_ptr()))
-            .map_err(|e| e.to_string())?;
-        let vol: IAudioEndpointVolume = dev.Activate(CLSCTX_ALL, None).map_err(|e| e.to_string())?;
-        let prev = vol.GetMute().map_err(|e| e.to_string())?.as_bool();
-        vol.SetMute(mute, std::ptr::null())
-            .map_err(|e| e.to_string())?;
-        Ok(prev)
     }
 }

@@ -29,4 +29,3 @@ nusb = "0.1.14"
 # WASAPI loopback capture for the desktop PCM source (Windows only).
 [target.'cfg(windows)'.dependencies]
 wasapi = "0.25"
-windows = { version = "0.62", features = ["Win32_Media_Audio", "Win32_Media_Audio_Endpoints", "Win32_System_Com", "Win32_Foundation"] }

@@ -9,7 +9,6 @@ dependencies = [
  "futures-lite",
  "nusb",
  "wasapi",
- "windows",
 ]
 
 [[package]]

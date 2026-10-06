@@ -148,9 +148,9 @@ type LoopbackSource = aslc::audio::LoopbackSource;
 type LoopbackSource = ();
 
 #[cfg(windows)]
-fn open_loopback_source(selector: Option<&str>, mute: bool) -> Option<LoopbackSource> {
+fn open_loopback_source(selector: Option<&str>) -> Option<LoopbackSource> {
     selector.map(|sel| {
-        aslc::audio::LoopbackSource::open(Some(sel), mute).unwrap_or_else(|e| {
+        aslc::audio::LoopbackSource::open(Some(sel)).unwrap_or_else(|e| {
             eprintln!("loopback unavailable: {e}");
             std::process::exit(1);
         })
@@ -158,7 +158,7 @@ fn open_loopback_source(selector: Option<&str>, mute: bool) -> Option<LoopbackSo
 }
 
 #[cfg(not(windows))]
-fn open_loopback_source(selector: Option<&str>, _mute: bool) -> Option<LoopbackSource> {
+fn open_loopback_source(selector: Option<&str>) -> Option<LoopbackSource> {
     if selector.is_some() {
         eprintln!("--device (WASAPI loopback) is Windows-only");
         std::process::exit(1);
@@ -235,9 +235,8 @@ fn run_capture(args: Vec<String>) {
         .get(2)
         .cloned()
         .unwrap_or_else(|| "aslc_capture.wav".to_string());
-    let mute = args.iter().any(|a| a == "--mute");
 
-    let mut src = match aslc::audio::LoopbackSource::open(selector.as_deref(), mute) {
+    let mut src = match aslc::audio::LoopbackSource::open(selector.as_deref()) {
         Ok(s) => s,
         Err(e) => {
             eprintln!("loopback unavailable: {e}");
@@ -438,13 +437,12 @@ fn run_aoa(args: Vec<String>) {
     let fmt = fmt_target;
     let tone = args.iter().any(|a| a == "--tone");
     let device = parse_flag(&args, "--device");
-    let mute = args.iter().any(|a| a == "--mute");
     let seconds: u64 = parse_flag(&args, "--for")
         .and_then(|s| s.parse().ok())
         .unwrap_or(2);
 
     // Optional WASAPI loopback source (Windows): capture a selected render endpoint.
-    let mut loopback = open_loopback_source(device.as_deref(), mute);
+    let mut loopback = open_loopback_source(device.as_deref());
 
     println!(
         "streaming {} PCM for ~{}s...",

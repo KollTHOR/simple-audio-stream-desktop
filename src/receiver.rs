@@ -11,7 +11,8 @@
 use crate::capabilities::PcmCapabilities;
 use crate::format::PcmFormat;
 use crate::frame::{
-    AslcError, AslcHeader, FrameReader, MSG_CAPABILITIES, MSG_CONFIGURE_ACK, MSG_ERROR, MSG_HELLO,
+    decode_header, AslcError, AslcHeader, FrameReader, HEADER_SIZE, MSG_CAPABILITIES,
+    MSG_CONFIGURE_ACK, MSG_ERROR, MSG_HELLO,
 };
 use crate::payload::{
     parse_capabilities, parse_configure_ack, parse_error, parse_hello, Hello, PcmError,
@@ -37,11 +38,16 @@ pub enum Negotiation {
     Rejected(PcmError),
 }
 
+/// Upper bound on bytes skipped while resyncing before giving up (guards against scanning a
+/// non-ASLC stream forever).
+const MAX_RESYNC_BYTES: usize = 64 * 1024;
+
 /// Reads + decodes inbound frames from a byte source into [`Inbound`] values. `Ok(None)` = clean EOF
 /// (Android detached). Non-version/recoverable framing errors surface as [`AslcError`].
 pub struct InboundReader<R: std::io::Read> {
     frames: FrameReader<R>,
     payload: Vec<u8>,
+    resynced_bytes: u64,
 }
 
 impl<R: std::io::Read> InboundReader<R> {
@@ -49,14 +55,46 @@ impl<R: std::io::Read> InboundReader<R> {
         Self {
             frames: FrameReader::new(src),
             payload: Vec::new(),
+            resynced_bytes: 0,
         }
     }
 
+    /// Total bytes discarded while resyncing past stale/desynced data (diagnostics).
+    pub fn resynced_bytes(&self) -> u64 {
+        self.resynced_bytes
+    }
+
     pub fn next_inbound(&mut self) -> Result<Option<Inbound>, AslcError> {
-        let header = match self.frames.read_header()? {
-            Some(h) => h,
-            None => return Ok(None), // EOF
+        let mut window = [0u8; HEADER_SIZE];
+        if !self.frames.read_fully(&mut window)? {
+            return Ok(None); // clean EOF
+        }
+        // Resync past stale bytes. The AOA pipe is reused across sessions and ASLC framing has no
+        // sync word, so frames an earlier session wrote but never had read can precede ours on the
+        // next open. Scan byte-by-byte for the first offset that decodes as a valid header; the
+        // version/type/length checks reject essentially all random alignments.
+        let mut dropped = 0usize;
+        let header = loop {
+            match decode_header(&window) {
+                Ok(h) => break h,
+                Err(AslcError::MalformedHeader) | Err(AslcError::UnsupportedVersion(_)) => {
+                    if dropped >= MAX_RESYNC_BYTES {
+                        return Err(AslcError::MalformedHeader);
+                    }
+                    window.copy_within(1..HEADER_SIZE, 0);
+                    let mut one = [0u8; 1];
+                    if !self.frames.read_fully(&mut one)? {
+                        return Ok(None);
+                    }
+                    window[HEADER_SIZE - 1] = one[0];
+                    dropped += 1;
+                }
+                Err(e) => return Err(e),
+            }
         };
+        if dropped > 0 {
+            self.resynced_bytes += dropped as u64;
+        }
         self.frames
             .read_payload_into(&mut self.payload, header.payload_length as usize)?;
         Ok(Some(decode_inbound(&header, &self.payload)?))
@@ -119,6 +157,11 @@ impl Receiver {
         match inbound {
             Inbound::Hello(_) => None,
             Inbound::Capabilities(caps) => {
+                // Only negotiate off the first capability set. A reconnect / HELLO-resync can
+                // deliver a second CAPABILITIES; re-emitting Ready would send a second CONFIGURE.
+                if self.state != State::AwaitingCaps {
+                    return None;
+                }
                 self.capabilities = Some(caps.clone());
                 self.state = if caps.sample_rates.is_empty() {
                     State::Failed
@@ -247,6 +290,30 @@ mod tests {
         let step = recv.handle(&ack_in).unwrap();
         assert_eq!(step, Negotiation::Accepted(fmt));
         assert!(recv.is_streaming());
+    }
+
+    #[test]
+    fn resyncs_past_stale_bytes_to_a_valid_frame() {
+        let caps = PcmCapabilities::full_matrix();
+        let caps_frame = encode_frame(MSG_CAPABILITIES, &capabilities_payload(&caps), 0);
+        // A previous session left 5 unread bytes on the reused pipe before a valid frame.
+        let mut stream = vec![0xFFu8; 5];
+        stream.extend_from_slice(&caps_frame);
+        let mut reader = InboundReader::new(&stream[..]);
+        let inbound = reader.next_inbound().unwrap().unwrap();
+        assert!(matches!(inbound, Inbound::Capabilities(_)));
+        assert_eq!(reader.resynced_bytes(), 5);
+    }
+
+    #[test]
+    fn duplicate_capabilities_only_negotiate_once() {
+        let mut recv = Receiver::new();
+        let caps = PcmCapabilities::full_matrix();
+        let first = recv.handle(&Inbound::Capabilities(caps.clone()));
+        assert!(matches!(first, Some(Negotiation::Ready(_, _))));
+        // A HELLO-driven resync re-delivers the same set; it must not queue a second CONFIGURE.
+        let second = recv.handle(&Inbound::Capabilities(caps));
+        assert!(second.is_none());
     }
 
     #[test]

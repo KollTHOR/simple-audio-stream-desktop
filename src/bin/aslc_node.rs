@@ -199,6 +199,16 @@ fn run_aoa(args: Vec<String>) {
     let mut seq: u32 = 0;
     let fmt_target;
 
+    // Host-initiated resync. The device advertises HELLO/CAPABILITIES only once, on adoption, then
+    // waits for CONFIGURE. Without a nudge, a reconnect ("Listen" again after a stream ends)
+    // deadlocks: the fresh host waits for CAPS that were already sent. Sending our HELLO makes an
+    // already-adopted app re-advertise, so re-negotiation always works.
+    let hello = hello_payload(PROTOCOL_VERSION, false, "ASLC Node");
+    outbound
+        .write_frame(MSG_HELLO, &hello, 0, hello.len(), seq)
+        .unwrap();
+    seq += 1;
+
     loop {
         let msg = match rx.recv_timeout(std::time::Duration::from_secs(wait_secs)) {
             Ok(Ok(m)) => m,

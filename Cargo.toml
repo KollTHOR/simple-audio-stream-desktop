@@ -14,10 +14,6 @@ license = "MIT"
 name = "aslc_node"
 path = "src/bin/aslc_node.rs"
 
-[[bin]]
-name = "aslc_audio_probe"
-path = "src/bin/aslc_audio_probe.rs"
-
 [lib]
 name = "aslc"
 path = "src/lib.rs"

@@ -26,6 +26,7 @@
     <Driver_SpectreMitigation>false</Driver_SpectreMitigation>
     <SignMode>Off</SignMode>
     <EnableSigningAfterBuild>false</EnableSigningAfterBuild>
+    <SkipPackageVerification>true</SkipPackageVerification>
     <UseDebugLibraries Condition="'$(Configuration)'=='Debug'">true</UseDebugLibraries>
     <UseDebugLibraries Condition="'$(Configuration)'=='Release'">false</UseDebugLibraries>
   </PropertyGroup>
@@ -62,6 +63,15 @@
     <ClCompile Include="..\third_party\sysvad\EndpointsCommon\AudioModuleHelper.cpp" />
     <ClCompile Include="src\aslc-engine-nodes.cpp" />
     <ClCompile Include="..\third_party\sysvad\EndpointsCommon\NewDelete.cpp" />
+  </ItemGroup>
+
+  <ItemGroup>
+    <Inf Include="inf\aslc-audio.inx" />
+  </ItemGroup>
+
+  <ItemGroup>
+    <FilesToPackage Include="$(TargetPath)" />
+    <FilesToPackage Include="@(Inf->'%(CopyOutput)')" Condition="'@(Inf)'!=''" />
   </ItemGroup>
 
   <Import Project="$(VCTargetsPath)\Microsoft.Cpp.targets" />

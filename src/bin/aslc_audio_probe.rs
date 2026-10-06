@@ -87,23 +87,45 @@ fn run() -> Result<(), String> {
         .unwrap_or_else(|| "aslc_capture.wav".to_string());
 
     let dev_path = b"\\\\.\\AslcAudio\0";
-    let h = unsafe {
-        CreateFileA(
-            dev_path.as_ptr(),
-            GENERIC_READ,
-            FILE_SHARE_READ | FILE_SHARE_WRITE,
-            std::ptr::null_mut(),
-            OPEN_EXISTING,
-            0,
-            std::ptr::null_mut(),
-        )
-    };
-    if h.is_null() || h as isize == -1 {
-        return Err(format!(
-            "could not open \\\\.\\AslcAudio: {}",
-            std::io::Error::last_os_error()
-        ));
+    // Diagnostic: which access rights does the DACL actually grant?
+    let masks: [(&str, u32); 6] = [
+        ("0 (open only)", 0),
+        ("FILE_READ_ATTRIBUTES", 0x80),
+        ("FILE_READ_DATA", 0x1),
+        ("GENERIC_READ", 0x8000_0000),
+        ("GENERIC_WRITE", 0x4000_0000),
+        ("GENERIC_READ|WRITE", 0xC000_0000),
+    ];
+    let mut opened: Option<win::Handle> = None;
+    for (label, access) in masks {
+        let h = unsafe {
+            CreateFileA(
+                dev_path.as_ptr(),
+                access,
+                FILE_SHARE_READ | FILE_SHARE_WRITE,
+                std::ptr::null_mut(),
+                OPEN_EXISTING,
+                0,
+                std::ptr::null_mut(),
+            )
+        };
+        if !h.is_null() && h as isize != -1 {
+            println!("open[{label}] (0x{access:08X}) -> OK");
+            if opened.is_none() {
+                opened = Some(h);
+            } else {
+                unsafe {
+                    win::CloseHandle(h);
+                }
+            }
+        } else {
+            println!(
+                "open[{label}] (0x{access:08X}) -> {}",
+                std::io::Error::last_os_error()
+            );
+        }
     }
+    let h = opened.ok_or_else(|| "no access mask could open \\\\.\\AslcAudio".to_string())?;
     let _guard = HandleGuard(h);
 
     // Negotiated format.

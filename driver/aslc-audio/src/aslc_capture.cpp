@@ -6,6 +6,7 @@ See aslc_capture.h for the design and the IOCTL contract.
 --*/
 
 #include <sysvad.h>
+#include <wdmsec.h>
 #include "aslc_capture.h"
 
 // 4 MB ring is ample for the POC and independent of stream format.
@@ -24,11 +25,6 @@ typedef struct _ASLC_CAPTURE
 
 static ASLC_CAPTURE g_Capture = {0};
 static WDFDEVICE    g_ControlDevice = NULL;
-
-// SDDL_DEVOBJ_SYS_ALL_ADM_RWX_WORLD_RWX_RES_RWX (defined inline to avoid a wdmsec.lib dep):
-// System all, admins RWX, world/resource RWX. Lets the companion (any user) read PCM.
-static UNICODE_STRING g_Sddl = RTL_CONSTANT_STRING(
-    L"D:P(A;;GA;;;SY)(A;;GRGWGX;;;BA)(A;;GRGWGX;;;WD)(A;;GRGWGX;;;RC)");
 
 // Forward declaration.
 VOID AslcEvtIoDeviceControl(
@@ -90,7 +86,7 @@ NTSTATUS AslcCaptureCreateDevice(_In_ PDRIVER_OBJECT DriverObject)
     g_Capture.Initialized = TRUE;
 
     // Control device, world-accessible (same SDDL family as the audio endpoint).
-    PWDFDEVICE_INIT init = WdfControlDeviceInitAllocate(driver, &g_Sddl);
+    PWDFDEVICE_INIT init = WdfControlDeviceInitAllocate(driver, &SDDL_DEVOBJ_SYS_ALL_ADM_RWX_WORLD_RWX_RES_RWX);
     if (init == NULL)
     {
         ExFreePoolWithTag(g_Capture.Buffer, 'csLA');

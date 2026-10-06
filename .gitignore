@@ -13,3 +13,11 @@ platform/winusb/aslc_aoa.cat
 platform/winusb/build/
 installer/cert/
 installer/output/
+
+# driver build outputs
+driver/**/x64/
+driver/**/*.sys
+driver/**/*.inf
+driver/**/*.cat
+driver/**/*.cer
+driver/**/*.pdb

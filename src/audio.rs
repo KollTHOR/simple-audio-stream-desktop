@@ -307,10 +307,12 @@ fn capture_thread(
             return;
         }
     };
-    let (_def, min) = client.get_device_period().unwrap_or((100_000, 100_000));
+    // Use the device's default period; some endpoints (notably at high rates) deliver no loopback
+    // data when initialized with the minimum period.
+    let (def, _min) = client.get_device_period().unwrap_or((100_000, 100_000));
     let mode = StreamMode::EventsShared {
         autoconvert: true,
-        buffer_duration_hns: min,
+        buffer_duration_hns: def,
     };
     if let Err(e) = client.initialize_client(&mix, &Direction::Capture, &mode) {
         let _ = ready.send(Err(format!("initialize loopback capture: {e}")));

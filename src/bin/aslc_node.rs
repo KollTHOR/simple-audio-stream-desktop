@@ -200,6 +200,16 @@ fn loopback_is_some(_src: &Option<LoopbackSource>) -> bool {
 }
 
 #[cfg(windows)]
+fn set_preferred_rate_from_loopback(recv: &mut aslc::Receiver, src: &Option<LoopbackSource>) {
+    if let Some(s) = src.as_ref() {
+        recv.set_preferred_sample_rate(Some(s.native_rate()));
+    }
+}
+
+#[cfg(not(windows))]
+fn set_preferred_rate_from_loopback(_recv: &mut aslc::Receiver, _src: &Option<LoopbackSource>) {}
+
+#[cfg(windows)]
 fn run_audio_list() {
     match aslc::audio::list_render_devices() {
         Ok(devices) => {
@@ -383,6 +393,12 @@ fn run_aoa(args: Vec<String>) {
         .unwrap();
     seq += 1;
 
+    // Optional WASAPI loopback source (Windows). Opened before negotiation so the receiver can
+    // negotiate the capture device's *native* sample rate (no resampling/downsampling).
+    let device = parse_flag(&args, "--device");
+    let mut loopback = open_loopback_source(device.as_deref());
+    set_preferred_rate_from_loopback(&mut recv, &loopback);
+
     loop {
         let msg = match rx.recv_timeout(std::time::Duration::from_secs(wait_secs)) {
             Ok(Ok(m)) => m,
@@ -436,13 +452,9 @@ fn run_aoa(args: Vec<String>) {
 
     let fmt = fmt_target;
     let tone = args.iter().any(|a| a == "--tone");
-    let device = parse_flag(&args, "--device");
     let seconds: u64 = parse_flag(&args, "--for")
         .and_then(|s| s.parse().ok())
         .unwrap_or(2);
-
-    // Optional WASAPI loopback source (Windows): capture a selected render endpoint.
-    let mut loopback = open_loopback_source(device.as_deref());
 
     println!(
         "streaming {} PCM for ~{}s...",

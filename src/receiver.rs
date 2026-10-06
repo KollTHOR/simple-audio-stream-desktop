@@ -128,6 +128,8 @@ pub struct Receiver {
     capabilities: Option<PcmCapabilities>,
     pending: Option<PcmFormat>,
     state: State,
+    /// If set and advertised, negotiate this sample rate (e.g. the capture device's native rate).
+    preferred_rate: Option<u32>,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -144,7 +146,13 @@ impl Receiver {
             capabilities: None,
             pending: None,
             state: State::AwaitingCaps,
+            preferred_rate: None,
         }
+    }
+
+    /// Prefer this sample rate when it is advertised (avoids resampling at the source).
+    pub fn set_preferred_sample_rate(&mut self, rate: Option<u32>) {
+        self.preferred_rate = rate;
     }
 
     pub fn capabilities(&self) -> Option<&PcmCapabilities> {
@@ -169,7 +177,7 @@ impl Receiver {
                     State::AwaitingAck
                 };
                 // Prefer 48000/16/2 if offered, else the first rate that has any 16-bit stereo slot.
-                match pick_format(caps) {
+                match pick_format(caps, self.preferred_rate) {
                     Some(fmt) => {
                         self.pending = Some(fmt);
                         Some(Negotiation::Ready(caps.clone(), fmt))
@@ -218,7 +226,7 @@ impl Default for Receiver {
 
 /// Pick a sensible initial format from advertised caps: 48k/16/stereo preferred; fall back to the
 /// lowest offered rate at 16-bit stereo; mono only if stereo is not advertised.
-pub fn pick_format(caps: &PcmCapabilities) -> Option<PcmFormat> {
+pub fn pick_format(caps: &PcmCapabilities, preferred_rate: Option<u32>) -> Option<PcmFormat> {
     let want_channels = if caps.channels.contains(&2) {
         2
     } else if caps.channels.contains(&1) {
@@ -232,7 +240,9 @@ pub fn pick_format(caps: &PcmCapabilities) -> Option<PcmFormat> {
         *caps.bit_depths.first()?
     };
     if caps.encodings.contains(&crate::format::ENCODING_PCM) {
-        let rate = if caps.sample_rates.contains(&48000) {
+        let rate = if let Some(p) = preferred_rate.filter(|p| caps.sample_rates.contains(p)) {
+            p
+        } else if caps.sample_rates.contains(&48000) {
             48000
         } else {
             *caps.sample_rates.iter().min()?

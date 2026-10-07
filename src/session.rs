@@ -80,6 +80,14 @@ pub enum SessionEvent {
     Paused(bool),
     /// Rolling throughput (kbit/s).
     Stats { kbps: f64 },
+    /// Latency figures (ms) from the PC pipeline and the phone.
+    Latency {
+        capture_ms: u32,
+        ring_fill_ms: u16,
+        ring_capacity_ms: u16,
+        device_ms: u16,
+        underruns: u32,
+    },
     /// Terminal: the session ended normally.
     Stopped(String),
     /// Terminal: the session failed.
@@ -478,10 +486,27 @@ fn run_session(
         // Detect a phone-side restart: when the receiver is stopped and started again it re-sends
         // HELLO/CAPABILITIES on the same pipe (the accessory connection persists). If we keep
         // streaming blindly, both sides end up stuck. Renegotiate instead.
+        let capture_ms = {
+            #[cfg(windows)]
+            {
+                loopback.as_ref().map(|l| l.period_ms()).unwrap_or(0)
+            }
+            #[cfg(not(windows))]
+            {
+                0u32
+            }
+        };
         let mut restarted = false;
         let mut reader_dead = false;
         while let Ok(ev) = irx.try_recv() {
             match ev {
+                Ok(Inbound::Telemetry(t)) => emit(SessionEvent::Latency {
+                    capture_ms,
+                    ring_fill_ms: t.ring_fill_ms,
+                    ring_capacity_ms: t.ring_capacity_ms,
+                    device_ms: t.device_latency_ms,
+                    underruns: t.underruns,
+                }),
                 Ok(Inbound::Hello(_))
                 | Ok(Inbound::Capabilities(_))
                 | Ok(Inbound::Error(_)) => restarted = true,

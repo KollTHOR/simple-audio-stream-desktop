@@ -73,6 +73,8 @@ struct AslcApp {
     status: String,
     negotiated: Option<PcmFormat>,
     kbps: f64,
+    /// (capture_ms, ring_fill_ms, ring_capacity_ms, device_ms, underruns)
+    latency: Option<(u32, u16, u16, u16, u32)>,
     log: Vec<String>,
 
     // Tray + window management (shared with the tray thread).
@@ -119,6 +121,7 @@ impl AslcApp {
             status: "Idle".into(),
             negotiated: None,
             kbps: 0.0,
+            latency: None,
             log: Vec::new(),
             _tray: None,
             hwnd: Arc::new(AtomicIsize::new(0)),
@@ -238,6 +241,16 @@ impl AslcApp {
                     self.push_log(format!("Negotiated {}", f.display_label()));
                 }
                 SessionEvent::Stats { kbps } => self.kbps = kbps,
+                SessionEvent::Latency {
+                    capture_ms,
+                    ring_fill_ms,
+                    ring_capacity_ms,
+                    device_ms,
+                    underruns,
+                } => {
+                    self.latency =
+                        Some((capture_ms, ring_fill_ms, ring_capacity_ms, device_ms, underruns));
+                }
                 SessionEvent::Paused(p) => self.paused = p,
                 SessionEvent::Stopped(s) => {
                     self.status = s.clone();
@@ -258,6 +271,7 @@ impl AslcApp {
             self.terminal = false;
             self.kbps = 0.0;
             self.paused = false;
+            self.latency = None;
         }
     }
 
@@ -279,6 +293,7 @@ impl AslcApp {
         self.status = "Starting…".into();
         self.negotiated = None;
         self.kbps = 0.0;
+        self.latency = None;
         self.terminal = false;
         self.push_log("== Start ==".into());
         self.session = Some(SessionHandle::start(cfg));
@@ -504,6 +519,12 @@ impl eframe::App for AslcApp {
                     ui.end_row();
                 });
 
+            ui.small(
+                "Latency note: a higher sample rate / bit depth enlarges the phone's jitter buffer, \
+                 which adds latency. 48 kHz · 16-bit is the lowest-latency option; 32-bit 96/192 kHz \
+                 buffers more for smoothness.",
+            );
+
             ui.separator();
 
             ui.horizontal(|ui| {
@@ -556,6 +577,16 @@ impl eframe::App for AslcApp {
             }
             if self.kbps > 0.0 {
                 ui.label(format!("Throughput: {:.0} kbit/s", self.kbps));
+            }
+            if let Some((cap, ring, ring_cap, dev, underruns)) = self.latency {
+                let total = cap + 10 + ring as u32 + dev as u32;
+                ui.label(format!(
+                    "Latency ≈ {total} ms   (PC {} ms · phone {} + {} ms)",
+                    cap + 10,
+                    ring,
+                    dev
+                ));
+                ui.small(format!("phone buffer {ring_cap} ms · underruns {underruns}"));
             }
 
             ui.separator();

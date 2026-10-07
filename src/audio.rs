@@ -23,8 +23,9 @@ use crate::format::PcmFormat;
 /// ~2 s cap on the capture buffer at 48 kHz stereo.
 const MAX_SAMPLES: usize = 96_000 * 2;
 
-/// Ready message from the capture thread: (rate, channels, bits, subformat, device id, device name).
-type CaptureReady = Result<(u32, u16, u16, String, String, String), String>;
+/// Ready message from the capture thread: (rate, channels, bits, subformat, device id, device name,
+/// period ms).
+type CaptureReady = Result<(u32, u16, u16, String, String, String, u32), String>;
 
 #[derive(Debug, Clone)]
 pub struct RenderDeviceInfo {
@@ -139,6 +140,7 @@ pub struct LoopbackSource {
     native_bits: u16,
     device_id: String,
     device_name: String,
+    period_ms: u32,
     /// Software output gain applied to every sample (1.0 = unity, set via [`set_gain`]).
     gain: f32,
     scratch: Vec<f32>,
@@ -162,7 +164,7 @@ impl LoopbackSource {
             .map_err(|e| format!("spawn capture thread: {e}"))?;
 
         match ready_rx.recv_timeout(std::time::Duration::from_secs(10)) {
-            Ok(Ok((rate, channels, bits, stype, id, name))) => {
+            Ok(Ok((rate, channels, bits, stype, id, name, period_ms))) => {
                 println!("loopback capture: {rate} Hz, {channels} ch, {bits}-bit {stype} [{name}]");
                 Ok(Self {
                     queue,
@@ -171,6 +173,7 @@ impl LoopbackSource {
                     native_bits: bits,
                     device_id: id,
                     device_name: name,
+                    period_ms,
                     gain: 1.0,
                     scratch: Vec::with_capacity(8192),
                     stop,
@@ -203,6 +206,11 @@ impl LoopbackSource {
     /// Friendly name of the opened device (for display).
     pub fn device_name(&self) -> &str {
         &self.device_name
+    }
+
+    /// Capture buffer period (ms) the loopback was opened with (a lower bound on capture latency).
+    pub fn period_ms(&self) -> u32 {
+        self.period_ms
     }
 
     /// Software output gain applied to every captured sample (1.0 = unity). Clamped to 0..=4.
@@ -390,6 +398,7 @@ fn capture_thread(
             .unwrap_or_else(|_| "?".into()),
         device_id,
         device_name,
+        (def / 10_000) as u32,
     )));
 
     let mut local: VecDeque<u8> = VecDeque::with_capacity(65536);

@@ -596,6 +596,16 @@ fn run_session_cmd(args: Vec<String>) {
                 aslc::SessionEvent::Negotiated(f) => println!("[format] {}", f.display_label()),
                 aslc::SessionEvent::Paused(p) => println!("[paused] {p}"),
                 aslc::SessionEvent::Stats { kbps } => println!("[stats] {kbps:.0} kbit/s"),
+                aslc::SessionEvent::Latency {
+                    capture_ms,
+                    ring_fill_ms,
+                    device_ms,
+                    underruns,
+                    ..
+                } => println!(
+                    "[latency] pc {}+10 ms · phone {}+{} ms · underruns {}",
+                    capture_ms, ring_fill_ms, device_ms, underruns
+                ),
                 aslc::SessionEvent::Stopped(s) => {
                     println!("[stopped] {s}");
                     done = true;

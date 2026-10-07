@@ -255,6 +255,40 @@ pub fn parse_error(payload: &[u8]) -> Option<PcmError> {
     })
 }
 
+// ---- TELEMETRY ---------------------------------------------------------------------------
+
+/// TELEMETRY payload (device -> host): the receiver's buffered audio, sent ~2 Hz while streaming.
+/// Layout: u16 ringFillMs, u16 ringCapacityMs, u16 deviceLatencyMs, u16 reserved, u32 underruns.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct Telemetry {
+    pub ring_fill_ms: u16,
+    pub ring_capacity_ms: u16,
+    pub device_latency_ms: u16,
+    pub underruns: u32,
+}
+
+pub fn telemetry_payload(t: &Telemetry) -> Vec<u8> {
+    let mut b = vec![0u8; 12];
+    write_u16_be(&mut b, 0, t.ring_fill_ms);
+    write_u16_be(&mut b, 2, t.ring_capacity_ms);
+    write_u16_be(&mut b, 4, t.device_latency_ms);
+    write_u16_be(&mut b, 6, 0);
+    write_u32_be(&mut b, 8, t.underruns);
+    b
+}
+
+pub fn parse_telemetry(payload: &[u8]) -> Option<Telemetry> {
+    if payload.len() < 12 {
+        return None;
+    }
+    Some(Telemetry {
+        ring_fill_ms: read_u16_be(payload, 0),
+        ring_capacity_ms: read_u16_be(payload, 2),
+        device_latency_ms: read_u16_be(payload, 4),
+        underruns: read_u32_be(payload, 8),
+    })
+}
+
 // ---- PCM_DATA ----------------------------------------------------------------------------
 
 /// Serializes a complete PCM_DATA frame: `u32 frameCount` + `frames * bytes_per_frame` raw bytes.

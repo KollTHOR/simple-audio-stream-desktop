@@ -20,6 +20,7 @@ pub const MSG_START: u8 = 0x05;
 pub const MSG_PCM_DATA: u8 = 0x06;
 pub const MSG_STOP: u8 = 0x07;
 pub const MSG_ERROR: u8 = 0x08;
+pub const MSG_TELEMETRY: u8 = 0x09;
 
 // Error codes (MSG_ERROR payload).
 pub const ERR_VERSION_UNSUPPORTED: u16 = 1;

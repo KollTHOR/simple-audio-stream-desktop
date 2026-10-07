@@ -44,6 +44,7 @@ consumes `12 + payload_length` bytes can never desync.
 | 0x06  | PCM_DATA        | host → device | PCM frames |
 | 0x07  | STOP            | host → device | end stream |
 | 0x08  | ERROR           | either        | protocol error |
+| 0x09  | TELEMETRY       | device → host | periodic buffer/latency figures |
 
 **Initiator:** the Android *device* speaks first. On attach it sends `HELLO` + `CAPABILITIES`
 unprompted; the desktop *host* does **not** need to send `HELLO` first. The host replies with
@@ -105,6 +106,12 @@ Empty payload.
 
 ### ERROR (either)
 `u16 error_code, u8 offending_message_type, u8 reserved(=0), UTF-8 message (rest)`
+
+### TELEMETRY (device → host)
+Sent periodically (~2 Hz) while `STREAMING`; lets the host display real latency figures. The
+device reports what it can measure locally (its input ring buffer + its AudioTrack buffering); the
+host adds its own capture/transport terms.
+`u16 ring_fill_ms, u16 ring_capacity_ms, u16 device_latency_ms, u16 reserved(=0), u32 underruns`
 
 ## PCM sample format
 

@@ -12,10 +12,11 @@ use crate::capabilities::PcmCapabilities;
 use crate::format::PcmFormat;
 use crate::frame::{
     decode_header, AslcError, AslcHeader, FrameReader, HEADER_SIZE, MSG_CAPABILITIES,
-    MSG_CONFIGURE_ACK, MSG_ERROR, MSG_HELLO,
+    MSG_CONFIGURE_ACK, MSG_ERROR, MSG_HELLO, MSG_TELEMETRY,
 };
 use crate::payload::{
-    parse_capabilities, parse_configure_ack, parse_error, parse_hello, Hello, PcmError,
+    parse_capabilities, parse_configure_ack, parse_error, parse_hello, parse_telemetry, Hello,
+    PcmError, Telemetry,
 };
 
 /// A decoded inbound (device->host) control message.
@@ -25,6 +26,8 @@ pub enum Inbound {
     Capabilities(PcmCapabilities),
     ConfigureAck(PcmFormat),
     Error(PcmError),
+    /// Periodic buffer/latency figures from the device (while streaming).
+    Telemetry(Telemetry),
 }
 
 /// Outcome of the negotiation state machine.
@@ -117,6 +120,9 @@ pub fn decode_inbound(header: &AslcHeader, payload: &[u8]) -> Result<Inbound, As
         MSG_ERROR => parse_error(payload)
             .map(Inbound::Error)
             .ok_or(AslcError::MalformedHeader),
+        MSG_TELEMETRY => parse_telemetry(payload)
+            .map(Inbound::Telemetry)
+            .ok_or(AslcError::MalformedHeader),
         _ => Err(AslcError::MalformedHeader), // unexpected inbound type for a host
     }
 }
@@ -184,6 +190,7 @@ impl Receiver {
     pub fn handle(&mut self, inbound: &Inbound) -> Option<Negotiation> {
         match inbound {
             Inbound::Hello(_) => None,
+            Inbound::Telemetry(_) => None,
             Inbound::Capabilities(caps) => {
                 // Only negotiate off the first capability set. A reconnect / HELLO-resync can
                 // deliver a second CAPABILITIES; re-emitting Ready would send a second CONFIGURE.

@@ -14,10 +14,13 @@
 //! on any host.
 
 use std::io::{Read, Write};
+use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::{Arc, Mutex};
+use std::task::{Poll, Waker};
 use std::time::{Duration, Instant};
 
 use futures_lite::future::block_on;
-use nusb::transfer::{Control, ControlType, Direction, EndpointType, Recipient, RequestBuffer};
+use nusb::transfer::{Control, ControlType, Direction, EndpointType, Queue, Recipient, RequestBuffer};
 use nusb::{Device, DeviceInfo, Interface};
 
 use crate::frame::AslcError;
@@ -133,6 +136,189 @@ pub fn find_probe_target() -> Option<(u16, u16)> {
         first.get_or_insert((d.vendor_id(), d.product_id()));
     }
     first
+}
+
+/// Vendor IDs of Android phones/DAPs that can run the AOA accessory. `0x18d1` is Google/Qualcomm
+/// (the M300); the rest are common OEMs whose phones enumerate under their own VID before the
+/// handshake. On Windows an MTP-capable device is also accepted regardless of VID.
+const ANDROID_VIDS: &[u16] = &[
+    0x18d1, // Google / Qualcomm (HiBy M300)
+    0x2717, // Xiaomi
+    0x04e8, // Samsung
+    0x12d1, // Huawei
+    0x2a70, // OnePlus
+    0x22d9, // Oppo / Realme
+    0x2d95, // Vivo
+    0x22b8, // Motorola
+    0x0bb4, // HTC
+    0x1004, // LG
+    0x2916, // Nothing
+    0x2207, // Rockchip (some DAPs)
+];
+
+/// True if the device publishes an MTP-compatible interface (so it's most likely an Android
+/// phone/DAP), read from the Windows registry's `CompatibleIDs`. Vendor-agnostic.
+#[cfg(windows)]
+fn registry_is_mtp(vid: u16, pid: u16) -> bool {
+    use winreg::enums::HKEY_LOCAL_MACHINE;
+    use winreg::RegKey;
+
+    let hklm = RegKey::predef(HKEY_LOCAL_MACHINE);
+    let Ok(usb) = hklm.open_subkey("SYSTEM\\CurrentControlSet\\Enum\\USB") else {
+        return false;
+    };
+    let prefix = format!("VID_{vid:04X}&PID_{pid:04X}");
+    for key_name in usb.enum_keys().flatten() {
+        if !key_name.starts_with(&prefix) {
+            continue;
+        }
+        let Ok(key) = usb.open_subkey(&key_name) else {
+            continue;
+        };
+        for inst in key.enum_keys().flatten() {
+            let Ok(sub) = key.open_subkey(&inst) else {
+                continue;
+            };
+            if let Ok(ids) = sub.get_value::<Vec<String>, _>("CompatibleIDs") {
+                if ids.iter().any(|s| s.contains("MS_COMP_MTP")) {
+                    return true;
+                }
+            }
+        }
+    }
+    false
+}
+
+#[cfg(not(windows))]
+fn registry_is_mtp(_vid: u16, _pid: u16) -> bool {
+    false
+}
+
+/// A candidate ASLC receiver: a phone/DAP that can run the AOA accessory.
+#[derive(Debug, Clone)]
+pub struct ReceiverDevice {
+    pub vid: u16,
+    pub pid: u16,
+    /// Already enumerates in AOA accessory mode (ready to attach, no handshake needed).
+    pub accessory: bool,
+    /// USB descriptor name (may be a board/empty string on some devices).
+    pub name: String,
+    pub serial: String,
+}
+
+impl ReceiverDevice {
+    /// Default label when no nickname is set.
+    pub fn default_label(&self) -> String {
+        if self.name.is_empty() {
+            format!("Receiver {:04x}:{:04x}", self.vid, self.pid)
+        } else {
+            self.name.clone()
+        }
+    }
+}
+
+/// Read the device's real name from the Windows registry. Explorer/File Manager shows the MTP
+/// (WPD) device's name — e.g. "HiBy M300" — which the registry stores as `DeviceDesc`/`Mfg` on the
+/// `...\Enum\USB\VID_xxxx&PID_yyyy&MI_00` key. That key persists after the phone switches to
+/// accessory mode, so this also names an already-attached accessory.
+#[cfg(windows)]
+fn registry_device_name(vid: u16, pid: Option<u16>) -> Option<String> {
+    use winreg::enums::HKEY_LOCAL_MACHINE;
+    use winreg::RegKey;
+
+    let hklm = RegKey::predef(HKEY_LOCAL_MACHINE);
+    let usb = hklm
+        .open_subkey("SYSTEM\\CurrentControlSet\\Enum\\USB")
+        .ok()?;
+    let exact = pid.map(|p| format!("VID_{vid:04X}&PID_{p:04X}&MI_00"));
+    for key_name in usb.enum_keys().flatten() {
+        let matches = match &exact {
+            Some(want) => &key_name == want,
+            None => key_name.starts_with(&format!("VID_{vid:04X}&PID_")) && key_name.ends_with("&MI_00"),
+        };
+        if !matches {
+            continue;
+        }
+        let Ok(key) = usb.open_subkey(&key_name) else {
+            continue;
+        };
+        for inst in key.enum_keys().flatten() {
+            let Ok(sub) = key.open_subkey(&inst) else {
+                continue;
+            };
+            let desc: String = sub.get_value("DeviceDesc").unwrap_or_default();
+            let desc = desc.rsplit(';').next().unwrap_or(&desc).trim().to_string();
+            if desc.is_empty()
+                || desc.starts_with('@')
+                || desc.contains("ASLC")
+                || desc.eq_ignore_ascii_case("USB Composite Device")
+            {
+                continue;
+            }
+            let mfg: String = sub.get_value("Mfg").unwrap_or_default();
+            let mfg = mfg.rsplit(';').next().unwrap_or(&mfg).trim().to_string();
+            return Some(if mfg.is_empty() {
+                desc
+            } else {
+                format!("{mfg} {desc}")
+            });
+        }
+    }
+    None
+}
+
+/// Enumerate AOA-capable receivers: devices already in accessory mode, plus Google-VID (`0x18d1`)
+/// Android/DAP devices that a handshake can switch into accessory mode.
+pub fn list_receiver_devices() -> Vec<ReceiverDevice> {
+    let mut out = Vec::new();
+    if let Ok(devs) = nusb::list_devices() {
+        for d in devs {
+            let vid = d.vendor_id();
+            let pid = d.product_id();
+            let accessory = is_accessory_device(&d);
+            let candidate = accessory
+                || ANDROID_VIDS.contains(&vid)
+                || registry_is_mtp(vid, pid);
+            if !candidate {
+                continue;
+            }
+            let m = d.manufacturer_string().unwrap_or("").trim();
+            let p = d.product_string().unwrap_or("").trim();
+            // Some devices (notably Qualcomm reference boards) put the serial in the product
+            // string as "..._SN:xxxx"; split it out so the name is cleaner.
+            let (p_clean, embedded_sn) = match p.split_once("_SN:") {
+                Some((before, after)) => (before.trim(), after.trim()),
+                None => (p, ""),
+            };
+            let descriptor_name = format!("{m} {p_clean}").trim().to_string();
+            // Prefer the device's real MTP/WPD name (what Explorer/File Manager shows); the USB
+            // descriptor strings are often just a board id.
+            #[cfg(windows)]
+            let name = registry_device_name(vid, Some(pid))
+                .or_else(|| registry_device_name(vid, None))
+                .unwrap_or(descriptor_name);
+            #[cfg(not(windows))]
+            let name = descriptor_name;
+            let serial = if !embedded_sn.is_empty() {
+                embedded_sn.to_string()
+            } else {
+                d.serial_number().unwrap_or("").trim().to_string()
+            };
+            out.push(ReceiverDevice {
+                vid,
+                pid,
+                accessory,
+                name,
+                serial,
+            });
+        }
+    }
+    out.sort_by(|a, b| {
+        b.accessory
+            .cmp(&a.accessory)
+            .then_with(|| a.name.cmp(&b.name))
+    });
+    out
 }
 
 /// Non-destructive capability probe: open the device, try claiming each low interface number,
@@ -260,6 +446,9 @@ pub struct AoaTransport {
     /// Holds the claimed accessory interface so it stays alive while the halves use it (Interface is
     /// Arc-backed; the halves clone it, this keeps a reference so the claim survives `open` returning).
     keepalive: Option<Interface>,
+    /// Cancellation for the bulk-IN reader, so a terminated session releases the interface.
+    reader_cancel: Option<Arc<AtomicBool>>,
+    reader_waker: Option<Arc<Mutex<Option<Waker>>>>,
 }
 
 impl AoaTransport {
@@ -269,6 +458,8 @@ impl AoaTransport {
         Self {
             pre_handshake: Some((vid, pid)),
             keepalive: None,
+            reader_cancel: None,
+            reader_waker: None,
         }
     }
 
@@ -277,6 +468,20 @@ impl AoaTransport {
         Self {
             pre_handshake: None,
             keepalive: None,
+            reader_cancel: None,
+            reader_waker: None,
+        }
+    }
+
+    /// Cancel the bulk-IN reader, unblocking it so it exits and drops its interface reference.
+    pub fn cancel_reader(&self) {
+        if let Some(c) = &self.reader_cancel {
+            c.store(true, Ordering::SeqCst);
+        }
+        if let Some(w) = &self.reader_waker {
+            if let Some(wk) = w.lock().ok().and_then(|mut g| g.take()) {
+                wk.wake();
+            }
         }
     }
 
@@ -403,11 +608,19 @@ impl Transport for AoaTransport {
         // Case A/B: attach to the accessory and hand back bulk halves.
         let (iface, in_ep, out_ep) = self.wait_for_accessory()?;
         self.keepalive = Some(iface.clone());
+        let cancel = Arc::new(AtomicBool::new(false));
+        let waker: Arc<Mutex<Option<Waker>>> = Arc::new(Mutex::new(None));
+        self.reader_cancel = Some(cancel.clone());
+        self.reader_waker = Some(waker.clone());
+        let queue = iface.bulk_in_queue(in_ep);
         Ok((
-            Box::new(BulkReader {
-                iface: iface.clone(),
-                in_ep,
+            Box::new(QueueReader {
+                queue,
                 carry: Vec::new(),
+                cancel,
+                waker,
+                in_flight: false,
+                done: false,
             }),
             Box::new(BulkWriter { iface, out_ep }),
         ))
@@ -418,15 +631,20 @@ impl Transport for AoaTransport {
     }
 }
 
-/// Reader half: reads a bulk-IN packet at a time, buffering any over-read (`carry`) so `io::Read`
-/// partial-fill semantics hold even though delivery is packet-granular.
-struct BulkReader {
-    iface: Interface,
-    in_ep: u8,
+/// Reader half: a cancelable queue-based bulk-IN reader. Reads a packet at a time, buffering any
+/// over-read (`carry`) so `io::Read` partial-fill semantics hold even though delivery is
+/// packet-granular. Cancellation (see [`AoaTransport::cancel_reader`]) unblocks a pending read so a
+/// terminated session lets go of the interface.
+struct QueueReader {
+    queue: Queue<RequestBuffer>,
     carry: Vec<u8>,
+    cancel: Arc<AtomicBool>,
+    waker: Arc<Mutex<Option<Waker>>>,
+    in_flight: bool,
+    done: bool,
 }
 
-impl Read for BulkReader {
+impl Read for QueueReader {
     fn read(&mut self, buf: &mut [u8]) -> std::io::Result<usize> {
         if !self.carry.is_empty() {
             let n = buf.len().min(self.carry.len());
@@ -434,19 +652,52 @@ impl Read for BulkReader {
             self.carry.drain(..n);
             return Ok(n);
         }
-        if buf.is_empty() {
+        if buf.is_empty() || self.done {
             return Ok(0);
         }
-        let rb = RequestBuffer::new(MAX_BULK_READ);
-        let data = block_on(self.iface.bulk_in(self.in_ep, rb))
-            .into_result()
-            .map_err(io_to_std)?;
-        let n = buf.len().min(data.len());
-        buf[..n].copy_from_slice(&data[..n]);
-        if data.len() > n {
-            self.carry.extend_from_slice(&data[n..]);
+        if !self.in_flight {
+            self.queue.submit(RequestBuffer::new(MAX_BULK_READ));
+            self.in_flight = true;
         }
-        Ok(n)
+        let cancel = self.cancel.clone();
+        let waker_slot = self.waker.clone();
+        let mut outcome: Option<Result<Vec<u8>, String>> = None;
+        block_on(futures_lite::future::poll_fn(|cx| {
+            if cancel.load(Ordering::Relaxed) {
+                return Poll::Ready(());
+            }
+            *waker_slot.lock().unwrap() = Some(cx.waker().clone());
+            match self.queue.poll_next(cx) {
+                Poll::Ready(c) => {
+                    outcome = Some(match c.status {
+                        Ok(()) => Ok(c.data),
+                        Err(e) => Err(e.to_string()),
+                    });
+                    Poll::Ready(())
+                }
+                Poll::Pending => Poll::Pending,
+            }
+        }));
+        self.in_flight = false;
+        match outcome {
+            Some(Ok(data)) => {
+                let n = buf.len().min(data.len());
+                buf[..n].copy_from_slice(&data[..n]);
+                if data.len() > n {
+                    self.carry.extend_from_slice(&data[n..]);
+                }
+                Ok(n)
+            }
+            Some(Err(e)) => Err(std::io::Error::other(e)),
+            None => {
+                self.queue.cancel_all();
+                self.done = true;
+                Err(std::io::Error::new(
+                    std::io::ErrorKind::Interrupted,
+                    "reader cancelled",
+                ))
+            }
+        }
     }
 }
 

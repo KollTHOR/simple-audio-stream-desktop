@@ -130,6 +130,8 @@ pub struct Receiver {
     state: State,
     /// If set and advertised, negotiate this sample rate (e.g. the capture device's native rate).
     preferred_rate: Option<u32>,
+    /// If set and advertised, negotiate this bit depth (e.g. the capture device's native depth).
+    preferred_depth: Option<u8>,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -147,12 +149,30 @@ impl Receiver {
             pending: None,
             state: State::AwaitingCaps,
             preferred_rate: None,
+            preferred_depth: None,
         }
     }
 
     /// Prefer this sample rate when it is advertised (avoids resampling at the source).
     pub fn set_preferred_sample_rate(&mut self, rate: Option<u32>) {
         self.preferred_rate = rate;
+    }
+
+    /// Prefer this bit depth when it is advertised (avoids quantizing at the source).
+    pub fn set_preferred_bit_depth(&mut self, depth: Option<u8>) {
+        self.preferred_depth = depth;
+    }
+
+    /// Host-initiated live reconfiguration (the PC is master): while streaming, pick a new format
+    /// from the stored capabilities honoring `rate`/`depth`, arm it as the pending CONFIGURE, and
+    /// return it so the caller can send CONFIGURE. The next matching CONFIGURE_ACK is accepted as
+    /// normal, so the device follows the host's format without a teardown.
+    pub fn begin_reconfigure(&mut self, rate: Option<u32>, depth: Option<u8>) -> Option<PcmFormat> {
+        let caps = self.capabilities.clone()?;
+        let fmt = pick_format(&caps, rate, depth)?;
+        self.pending = Some(fmt);
+        self.state = State::AwaitingAck;
+        Some(fmt)
     }
 
     pub fn capabilities(&self) -> Option<&PcmCapabilities> {
@@ -177,7 +197,7 @@ impl Receiver {
                     State::AwaitingAck
                 };
                 // Prefer 48000/16/2 if offered, else the first rate that has any 16-bit stereo slot.
-                match pick_format(caps, self.preferred_rate) {
+                match pick_format(caps, self.preferred_rate, self.preferred_depth) {
                     Some(fmt) => {
                         self.pending = Some(fmt);
                         Some(Negotiation::Ready(caps.clone(), fmt))
@@ -226,7 +246,11 @@ impl Default for Receiver {
 
 /// Pick a sensible initial format from advertised caps: 48k/16/stereo preferred; fall back to the
 /// lowest offered rate at 16-bit stereo; mono only if stereo is not advertised.
-pub fn pick_format(caps: &PcmCapabilities, preferred_rate: Option<u32>) -> Option<PcmFormat> {
+pub fn pick_format(
+    caps: &PcmCapabilities,
+    preferred_rate: Option<u32>,
+    preferred_depth: Option<u8>,
+) -> Option<PcmFormat> {
     let want_channels = if caps.channels.contains(&2) {
         2
     } else if caps.channels.contains(&1) {
@@ -234,7 +258,9 @@ pub fn pick_format(caps: &PcmCapabilities, preferred_rate: Option<u32>) -> Optio
     } else {
         return None;
     };
-    let want_depth = if caps.bit_depths.contains(&16) {
+    let want_depth = if let Some(d) = preferred_depth.filter(|d| caps.bit_depths.contains(d)) {
+        d
+    } else if caps.bit_depths.contains(&16) {
         16
     } else {
         *caps.bit_depths.first()?

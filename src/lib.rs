@@ -19,6 +19,7 @@ pub mod frame;
 pub mod audio;
 pub mod payload;
 pub mod receiver;
+pub mod session;
 pub mod transport;
 
 pub use aoa::AoaTransport;
@@ -29,4 +30,5 @@ pub use frame::{
 };
 pub use payload::{Hello, PcmError};
 pub use receiver::Receiver;
+pub use session::{PhoneSelector, SessionConfig, SessionEvent, SessionHandle};
 pub use transport::{Halves, TcpTransport, Transport};

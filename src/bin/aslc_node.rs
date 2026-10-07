@@ -28,6 +28,8 @@ fn main() {
         Some("list-usb") => list_usb(),
         Some("probe") => run_probe(args.collect::<Vec<_>>()),
         Some("aoa") => run_aoa(args.collect::<Vec<_>>()),
+        Some("session") => run_session_cmd(args.collect::<Vec<_>>()),
+        Some("receivers") => run_receivers(),
         Some("audio") => run_audio_list(),
         Some("capture") => run_capture(args.collect::<Vec<_>>()),
         Some(other) => {
@@ -64,11 +66,16 @@ fn list_usb() {
                     String::new()
                 };
                 println!(
-                    "{:<4} {:04x}:{:04x}  {:>4}  {:?}  {}",
+                    "{:<4} {:04x}:{:04x}  {:<24}  {:?}  {}",
                     n,
                     d.vendor_id(),
                     d.product_id(),
-                    format!("{:02x}", d.class()),
+                    format!(
+                        "{} {}",
+                        d.manufacturer_string().unwrap_or(""),
+                        d.product_string().unwrap_or("")
+                    )
+                    .trim(),
                     d.speed(),
                     note
                 );
@@ -203,6 +210,7 @@ fn loopback_is_some(_src: &Option<LoopbackSource>) -> bool {
 fn set_preferred_rate_from_loopback(recv: &mut aslc::Receiver, src: &Option<LoopbackSource>) {
     if let Some(s) = src.as_ref() {
         recv.set_preferred_sample_rate(Some(s.native_rate()));
+        recv.set_preferred_bit_depth(Some(s.native_bits() as u8));
     }
 }
 
@@ -517,6 +525,107 @@ fn run_aoa(args: Vec<String>) {
         "done: sent {} PCM messages over AOA; check the Android USB Input card / Diagnostics.",
         seq.saturating_sub(1)
     );
+}
+
+/// List AOA-capable receivers (phones/DAPs) the desktop can connect to.
+fn run_receivers() {
+    let list = aslc::aoa::list_receiver_devices();
+    if list.is_empty() {
+        println!("(no AOA receivers found)");
+        return;
+    }
+    println!(
+        "{:<4} {:<12} {:<11} {:<30} serial",
+        "idx", "VID:PID", "mode", "name"
+    );
+    for (i, d) in list.iter().enumerate() {
+        println!(
+            "{:<4} {:04x}:{:04x}  {:<11} {:<30} {}",
+            i,
+            d.vid,
+            d.pid,
+            if d.accessory { "accessory" } else { "mtp/other" },
+            d.default_label(),
+            d.serial
+        );
+    }
+}
+
+/// Headless driver for the shared `session` module (the same engine the GUI uses). Lets the PC be
+/// the master: `--cycle` rotates the wire sample rate live so the phone follows without a restart.
+fn run_session_cmd(args: Vec<String>) {
+    let device = parse_flag(&args, "--device");
+    let rate = parse_flag(&args, "--rate").and_then(|s| s.parse::<u32>().ok());
+    let depth = parse_flag(&args, "--depth").and_then(|s| s.parse::<u8>().ok());
+    let cycle = args.iter().any(|a| a == "--cycle");
+    let pause_cycle = args.iter().any(|a| a == "--pause-cycle");
+    let seconds: u64 = parse_flag(&args, "--for")
+        .and_then(|s| s.parse().ok())
+        .unwrap_or(30);
+
+    let cfg = aslc::SessionConfig {
+        phone: aslc::PhoneSelector::Auto {
+            vid: 0x18d1,
+            pid: 0x4ee2,
+        },
+        device,
+        target_rate: rate,
+        target_depth: depth,
+        gain: 1.0,
+        tone: false,
+        wait_secs: 30,
+    };
+    let mut handle = aslc::SessionHandle::start(cfg);
+    let start = std::time::Instant::now();
+    let mut next_cycle = start + std::time::Duration::from_secs(8);
+    let cycle_rates: [Option<u32>; 4] = [Some(48_000), Some(96_000), Some(192_000), None];
+    let mut cycle_idx = 0usize;
+    let mut is_paused = false;
+    let mut next_pause = start + std::time::Duration::from_secs(8);
+    let mut done = false;
+
+    while !done && start.elapsed() < std::time::Duration::from_secs(seconds) {
+        std::thread::sleep(std::time::Duration::from_millis(100));
+        while let Some(ev) = handle.try_recv() {
+            match ev {
+                aslc::SessionEvent::State(s) => println!("[state] {s}"),
+                aslc::SessionEvent::Negotiated(f) => println!("[format] {}", f.display_label()),
+                aslc::SessionEvent::Paused(p) => println!("[paused] {p}"),
+                aslc::SessionEvent::Stats { kbps } => println!("[stats] {kbps:.0} kbit/s"),
+                aslc::SessionEvent::Stopped(s) => {
+                    println!("[stopped] {s}");
+                    done = true;
+                }
+                aslc::SessionEvent::Error(e) => {
+                    println!("[error] {e}");
+                    done = true;
+                }
+            }
+        }
+        if cycle && std::time::Instant::now() >= next_cycle {
+            cycle_idx = (cycle_idx + 1) % cycle_rates.len();
+            let r = cycle_rates[cycle_idx];
+            println!("[reconfigure] rate -> {r:?}");
+            handle.set_target_rate(r);
+            next_cycle = std::time::Instant::now() + std::time::Duration::from_secs(8);
+        }
+        if pause_cycle && std::time::Instant::now() >= next_pause {
+            if is_paused {
+                handle.resume();
+                is_paused = false;
+                println!("[cmd] resume");
+            } else {
+                handle.pause();
+                is_paused = true;
+                println!("[cmd] pause");
+            }
+            next_pause = std::time::Instant::now() + std::time::Duration::from_secs(8);
+        }
+    }
+
+    handle.request_stop();
+    handle.join();
+    println!("session done");
 }
 
 fn run_selftest() {

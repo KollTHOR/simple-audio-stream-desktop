@@ -33,8 +33,11 @@ PnpLockdown = 1
 ; M300 in file-transfer mode is a single-function (non-composite) node -> bare ID is correct.
 %PreHandshake.DeviceDesc% = ASLC_PreHandshake_Install, USB\VID_18D1&PID_4EE1
 %PreHandshake.DeviceDesc% = ASLC_PreHandshake_Install, USB\VID_18D1&PID_4EE1&MI_00
-; Xiaomi 15 (2717:FF40) intentionally NOT included until its AOA support is
-; confirmed; append its IDs to this section when validated.
+; Xiaomi 15 in file-transfer mode (2717:FF40). Binding this gives the AOA handshake a claimable
+; interface even when USB debugging is off; it replaces the WPD/MTP driver for this device on this
+; PC only (uninstall/rollback restores MTP). Do NOT add composite PIDs bare (see note below).
+%PreHandshake.DeviceDesc% = ASLC_PreHandshake_Install, USB\VID_2717&PID_FF40
+%PreHandshake.DeviceDesc% = ASLC_PreHandshake_Install, USB\VID_2717&PID_FF40&MI_00
 
 ; ---- AOA accessory data interface ----
 ; IMPORTANT: match the MI_00 CHILD of composites (2D01/2D04/2D05 carry adb/audio

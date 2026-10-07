@@ -23,6 +23,9 @@ use crate::format::PcmFormat;
 /// ~2 s cap on the capture buffer at 48 kHz stereo.
 const MAX_SAMPLES: usize = 96_000 * 2;
 
+/// Ready message from the capture thread: (rate, channels, bits, subformat, device id, device name).
+type CaptureReady = Result<(u32, u16, u16, String, String, String), String>;
+
 #[derive(Debug, Clone)]
 pub struct RenderDeviceInfo {
     pub index: usize,
@@ -90,9 +93,17 @@ pub fn list_render_devices() -> Result<Vec<RenderDeviceInfo>, String> {
     Ok(out)
 }
 
+/// The endpoint id of the current default render device (for "follow system default").
+pub fn default_render_device_id() -> Option<String> {
+    list_render_devices()
+        .ok()?
+        .into_iter()
+        .find(|d| d.is_default)
+        .map(|d| d.id)
+}
+
 /// Resolve a selector (index, or case-insensitive substring of the name) to a render device.
-fn resolve_device(enumerator: &DeviceEnumerator, selector: Option<&str>) -> Result<Device, String> {
-    if let Some(sel) = selector {
+fn resolve_device(enumerator: &DeviceEnumerator, selector: Option<&str>) -> Result<Device, String> {    if let Some(sel) = selector {
         if let Ok(idx) = sel.parse::<usize>() {
             let collection = enumerator
                 .get_device_collection(&Direction::Render)
@@ -125,6 +136,11 @@ pub struct LoopbackSource {
     queue: Arc<Mutex<VecDeque<f32>>>,
     native_rate: u32,
     native_channels: u16,
+    native_bits: u16,
+    device_id: String,
+    device_name: String,
+    /// Software output gain applied to every sample (1.0 = unity, set via [`set_gain`]).
+    gain: f32,
     scratch: Vec<f32>,
     stop: Arc<AtomicBool>,
     thread: Option<JoinHandle<()>>,
@@ -136,7 +152,7 @@ impl LoopbackSource {
     pub fn open(selector: Option<&str>) -> Result<Self, String> {
         let queue = Arc::new(Mutex::new(VecDeque::<f32>::with_capacity(MAX_SAMPLES)));
         let stop = Arc::new(AtomicBool::new(false));
-        let (ready_tx, ready_rx) = channel::<Result<(u32, u16, u16, String), String>>();
+        let (ready_tx, ready_rx) = channel::<CaptureReady>();
 
         let (q, s) = (queue.clone(), stop.clone());
         let selector = selector.map(|s| s.to_string());
@@ -146,12 +162,16 @@ impl LoopbackSource {
             .map_err(|e| format!("spawn capture thread: {e}"))?;
 
         match ready_rx.recv_timeout(std::time::Duration::from_secs(10)) {
-            Ok(Ok((rate, channels, bits, stype))) => {
-                println!("loopback capture: {rate} Hz, {channels} ch, {bits}-bit {stype}");
+            Ok(Ok((rate, channels, bits, stype, id, name))) => {
+                println!("loopback capture: {rate} Hz, {channels} ch, {bits}-bit {stype} [{name}]");
                 Ok(Self {
                     queue,
                     native_rate: rate,
                     native_channels: channels,
+                    native_bits: bits,
+                    device_id: id,
+                    device_name: name,
+                    gain: 1.0,
                     scratch: Vec::with_capacity(8192),
                     stop,
                     thread: Some(thread),
@@ -168,6 +188,26 @@ impl LoopbackSource {
 
     pub fn native_channels(&self) -> u16 {
         self.native_channels
+    }
+
+    /// Capture device mix bit depth (what we prefer to negotiate, to avoid quantizing).
+    pub fn native_bits(&self) -> u16 {
+        self.native_bits
+    }
+
+    /// Stable endpoint id of the opened device (for "follow the system default" tracking).
+    pub fn device_id(&self) -> &str {
+        &self.device_id
+    }
+
+    /// Friendly name of the opened device (for display).
+    pub fn device_name(&self) -> &str {
+        &self.device_name
+    }
+
+    /// Software output gain applied to every captured sample (1.0 = unity). Clamped to 0..=4.
+    pub fn set_gain(&mut self, gain: f32) {
+        self.gain = gain.clamp(0.0, 4.0);
     }
 
     /// Fill `out` with interleaved integer PCM in `fmt`, converting sample format, channel count
@@ -229,7 +269,7 @@ impl LoopbackSource {
                 if v != 0.0 {
                     frame_silent = false;
                 }
-                write_sample(fmt, out, i, ch, v);
+                write_sample(fmt, out, i, ch, v * self.gain);
             }
             if frame_silent {
                 silent += 1;
@@ -273,7 +313,7 @@ fn capture_thread(
     selector: Option<&str>,
     queue: Arc<Mutex<VecDeque<f32>>>,
     stop: Arc<AtomicBool>,
-    ready: Sender<Result<(u32, u16, u16, String), String>>,
+    ready: Sender<CaptureReady>,
 ) {
     if initialize_mta().is_err() {
         let _ = ready.send(Err("COM (MTA) init failed".into()));
@@ -293,6 +333,10 @@ fn capture_thread(
             return;
         }
     };
+    let device_id = device.get_id().unwrap_or_default();
+    let device_name = device
+        .get_friendlyname()
+        .unwrap_or_else(|_| "?".into());
     let mut client = match device.get_iaudioclient() {
         Ok(c) => c,
         Err(e) => {
@@ -344,6 +388,8 @@ fn capture_thread(
         mix.get_subformat()
             .map(|s| format!("{s}"))
             .unwrap_or_else(|_| "?".into()),
+        device_id,
+        device_name,
     )));
 
     let mut local: VecDeque<u8> = VecDeque::with_capacity(65536);

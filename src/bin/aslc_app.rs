@@ -1,0 +1,616 @@
+//! ASLC desktop control window (Windows-first).
+//!
+//! A small egui/eframe app that drives a [`aslc::session::SessionHandle`]: pick the phone link, the
+//! WASAPI loopback source, the wire sample rate / bit depth, a software volume, then Start/Stop.
+//!
+//! The PC is the master: changing the sample rate or bit depth while streaming sends a CONFIGURE and
+//! the phone follows live (no restart).
+//!
+//! Closing the window hides it to the system tray. Because eframe stops running `update()` while the
+//! window is hidden, tray events are handled on a dedicated thread that restores the window with a
+//! raw Win32 `ShowWindow` (egui commands only take effect during a frame).
+
+// No console window: this is a GUI app.
+#![cfg_attr(windows, windows_subsystem = "windows")]
+
+use std::sync::atomic::{AtomicBool, AtomicIsize, Ordering};
+use std::sync::Arc;
+use std::time::Duration;
+
+use eframe::egui;
+use raw_window_handle::{HasWindowHandle, RawWindowHandle};
+use tray_icon::{
+    menu::{Menu, MenuEvent, MenuItem},
+    MouseButton, MouseButtonState, TrayIcon, TrayIconBuilder, TrayIconEvent,
+};
+
+use aslc::aoa::ReceiverDevice;
+use aslc::session::{PhoneSelector, SessionConfig, SessionEvent, SessionHandle};
+use aslc::PcmFormat;
+
+fn main() -> eframe::Result<()> {
+    let options = eframe::NativeOptions {
+        viewport: egui::ViewportBuilder::default()
+            .with_inner_size([540.0, 600.0])
+            .with_min_inner_size([460.0, 420.0])
+            .with_title("ASLC Node"),
+        ..Default::default()
+    };
+    eframe::run_native(
+        "ASLC Node",
+        options,
+        Box::new(|cc| Box::new(AslcApp::new(cc))),
+    )
+}
+
+/// A selectable audio source (render endpoint).
+#[derive(Clone)]
+struct DeviceItem {
+    label: String,
+    selector: Option<String>,
+}
+
+struct AslcApp {
+    receivers: Vec<ReceiverDevice>,
+    receiver_idx: usize,
+
+    devices: Vec<DeviceItem>,
+    source_idx: usize,
+
+    rate_labels: Vec<&'static str>,
+    rate_values: Vec<Option<u32>>,
+    rate_idx: usize,
+
+    depth_labels: Vec<&'static str>,
+    depth_values: Vec<Option<u8>>,
+    depth_idx: usize,
+
+    gain: f32,
+
+    session: Option<SessionHandle>,
+    terminal: bool,
+    paused: bool,
+    status: String,
+    negotiated: Option<PcmFormat>,
+    kbps: f64,
+    log: Vec<String>,
+
+    // Tray + window management (shared with the tray thread).
+    _tray: Option<TrayIcon>,
+    hwnd: Arc<AtomicIsize>,
+    want_start: Arc<AtomicBool>,
+    want_stop: Arc<AtomicBool>,
+    hidden: bool,
+}
+
+impl AslcApp {
+    fn new(cc: &eframe::CreationContext<'_>) -> Self {
+        let mut app = Self {
+            receivers: Vec::new(),
+            receiver_idx: 0,
+            devices: Vec::new(),
+            source_idx: 0,
+            rate_labels: vec![
+                "Native (follow source)",
+                "44.1 kHz",
+                "48 kHz",
+                "88.2 kHz",
+                "96 kHz",
+                "176.4 kHz",
+                "192 kHz",
+            ],
+            rate_values: vec![
+                None,
+                Some(44_100),
+                Some(48_000),
+                Some(88_200),
+                Some(96_000),
+                Some(176_400),
+                Some(192_000),
+            ],
+            rate_idx: 0,
+            depth_labels: vec!["Native", "16-bit", "24-bit", "32-bit"],
+            depth_values: vec![None, Some(16), Some(24), Some(32)],
+            depth_idx: 0,
+            gain: 1.0,
+            session: None,
+            terminal: false,
+            paused: false,
+            status: "Idle".into(),
+            negotiated: None,
+            kbps: 0.0,
+            log: Vec::new(),
+            _tray: None,
+            hwnd: Arc::new(AtomicIsize::new(0)),
+            want_start: Arc::new(AtomicBool::new(false)),
+            want_stop: Arc::new(AtomicBool::new(false)),
+            hidden: false,
+        };
+        app.refresh_devices();
+        app.refresh_receivers();
+        app._tray = app.build_tray();
+        spawn_tray_thread(
+            cc.egui_ctx.clone(),
+            app.hwnd.clone(),
+            app.want_start.clone(),
+            app.want_stop.clone(),
+        );
+        app
+    }
+
+    fn build_tray(&mut self) -> Option<TrayIcon> {
+        let menu = Menu::new();
+        let show = MenuItem::with_id("show", "Show window", true, None);
+        let start = MenuItem::with_id("start", "Start", true, None);
+        let stop = MenuItem::with_id("stop", "Stop", true, None);
+        let quit = MenuItem::with_id("quit", "Quit", true, None);
+        let _ = menu.append_items(&[&show, &start, &stop, &quit]);
+        match TrayIconBuilder::new()
+            .with_menu(Box::new(menu))
+            .with_tooltip("ASLC Node")
+            .with_icon(make_icon())
+            .build()
+        {
+            Ok(t) => Some(t),
+            Err(e) => {
+                eprintln!("tray icon unavailable: {e}");
+                None
+            }
+        }
+    }
+
+    fn running(&self) -> bool {
+        self.session.is_some()
+    }
+
+    fn refresh_receivers(&mut self) {
+        self.receivers = aslc::aoa::list_receiver_devices();
+        self.receiver_idx = self.receiver_idx.min(self.receivers.len().saturating_sub(1));
+    }
+
+    fn receiver_display(&self, r: &ReceiverDevice) -> String {
+        if r.accessory {
+            format!("{}  · ready", r.default_label())
+        } else {
+            r.default_label()
+        }
+    }
+
+    fn selected_selector(&self) -> PhoneSelector {
+        match self.receivers.get(self.receiver_idx) {
+            Some(r) if r.accessory => PhoneSelector::Accessory,
+            Some(r) => PhoneSelector::Handshake {
+                vid: r.vid,
+                pid: r.pid,
+            },
+            None => PhoneSelector::Auto {
+                vid: 0x18d1,
+                pid: 0x4ee2,
+            },
+        }
+    }
+
+    #[cfg(windows)]
+    fn refresh_devices(&mut self) {
+        let list = aslc::audio::list_render_devices().unwrap_or_default();
+        let mut items = vec![DeviceItem {
+            label: "System default (follow)".into(),
+            selector: None,
+        }];
+        items.extend(list.into_iter().map(|d| DeviceItem {
+            label: format!(
+                "{}{}  ({})",
+                if d.is_default { "★ " } else { "" },
+                d.name,
+                d.format_label()
+            ),
+            selector: Some(d.name),
+        }));
+        self.devices = items;
+        self.source_idx = self.source_idx.min(self.devices.len().saturating_sub(1));
+    }
+
+    #[cfg(not(windows))]
+    fn refresh_devices(&mut self) {
+        self.devices.clear();
+    }
+
+    fn push_log(&mut self, line: String) {
+        self.log.push(line);
+        if self.log.len() > 200 {
+            self.log.remove(0);
+        }
+    }
+
+    fn poll(&mut self) {
+        let Some(s) = &self.session else {
+            return;
+        };
+        let mut events = Vec::new();
+        while let Some(ev) = s.try_recv() {
+            events.push(ev);
+        }
+        for ev in events {
+            match ev {
+                SessionEvent::State(s) => {
+                    self.status = s.clone();
+                    self.push_log(s);
+                }
+                SessionEvent::Negotiated(f) => {
+                    self.negotiated = Some(f);
+                    self.push_log(format!("Negotiated {}", f.display_label()));
+                }
+                SessionEvent::Stats { kbps } => self.kbps = kbps,
+                SessionEvent::Paused(p) => self.paused = p,
+                SessionEvent::Stopped(s) => {
+                    self.status = s.clone();
+                    self.push_log(format!("Stopped: {s}"));
+                    self.terminal = true;
+                }
+                SessionEvent::Error(e) => {
+                    self.status = format!("Error: {e}");
+                    self.push_log(format!("Error: {e}"));
+                    self.terminal = true;
+                }
+            }
+        }
+        if self.terminal {
+            if let Some(mut h) = self.session.take() {
+                h.join();
+            }
+            self.terminal = false;
+            self.kbps = 0.0;
+            self.paused = false;
+        }
+    }
+
+    fn start(&mut self) {
+        let phone = self.selected_selector();
+        let device = self
+            .devices
+            .get(self.source_idx)
+            .and_then(|d| d.selector.clone());
+        let cfg = SessionConfig {
+            phone,
+            device,
+            target_rate: self.rate_values[self.rate_idx],
+            target_depth: self.depth_values[self.depth_idx],
+            gain: self.gain,
+            tone: false,
+            wait_secs: 30,
+        };
+        self.status = "Starting…".into();
+        self.negotiated = None;
+        self.kbps = 0.0;
+        self.terminal = false;
+        self.push_log("== Start ==".into());
+        self.session = Some(SessionHandle::start(cfg));
+    }
+
+    fn pause(&mut self) {
+        if let Some(s) = &self.session {
+            s.pause();
+        }
+        self.status = "Pausing…".into();
+    }
+
+    fn resume(&mut self) {
+        if let Some(s) = &self.session {
+            s.resume();
+        }
+        self.status = "Resuming…".into();
+    }
+}
+
+impl eframe::App for AslcApp {
+    fn update(&mut self, ctx: &egui::Context, frame: &mut eframe::Frame) {
+        // Remember the HWND so the tray thread can restore the window directly.
+        if self.hwnd.load(Ordering::SeqCst) == 0 {
+            #[cfg(windows)]
+            if let Ok(wh) = frame.window_handle() {
+                if let RawWindowHandle::Win32(h) = wh.as_raw() {
+                    self.hwnd.store(h.hwnd.get(), Ordering::SeqCst);
+                }
+            }
+        }
+
+        // If we got here while marked hidden, we were restored externally (raw ShowWindow):
+        // reconcile eframe's viewport state.
+        if self.hidden {
+            self.hidden = false;
+            ctx.send_viewport_cmd(egui::ViewportCommand::Minimized(false));
+        }
+
+        // Tray-initiated Start/Stop (set by the tray thread).
+        if self.want_start.swap(false, Ordering::SeqCst) {
+            if !self.running() {
+                self.start();
+            } else if self.paused {
+                self.resume();
+            }
+        }
+        if self.want_stop.swap(false, Ordering::SeqCst) && self.running() && !self.paused {
+            self.pause();
+        }
+
+        self.poll();
+
+        // Close → minimize (stays running in the taskbar); tray restores it.
+        if ctx.input(|i| i.viewport().close_requested()) {
+            ctx.send_viewport_cmd(egui::ViewportCommand::CancelClose);
+            ctx.send_viewport_cmd(egui::ViewportCommand::Minimized(true));
+            self.hidden = true;
+        }
+
+        egui::CentralPanel::default().show(ctx, |ui| {
+            ui.heading("ASLC Node");
+            ui.label("Stream this PC's audio to the phone over USB (AOA). The PC controls the format.");
+            ui.separator();
+
+            egui::Grid::new("settings")
+                .num_columns(2)
+                .spacing([12.0, 8.0])
+                .show(ui, |ui| {
+                    ui.label("Receiver:");
+                    ui.horizontal(|ui| {
+                        let mut idx = self.receiver_idx;
+                        let label = self
+                            .receivers
+                            .get(idx)
+                            .map(|r| self.receiver_display(r))
+                            .unwrap_or_else(|| "(no receiver found)".into());
+                        egui::ComboBox::from_id_source("receiver")
+                            .width(300.0)
+                            .selected_text(label)
+                            .show_ui(ui, |ui| {
+                                for i in 0..self.receivers.len() {
+                                    let text = self.receiver_display(&self.receivers[i]);
+                                    ui.selectable_value(&mut idx, i, text);
+                                }
+                            });
+                        if idx != self.receiver_idx {
+                            self.receiver_idx = idx;
+                        }
+                        if ui.button("Refresh").clicked() {
+                            self.refresh_receivers();
+                        }
+                    });
+                    ui.end_row();
+
+                    ui.label("Source:");
+                    ui.horizontal(|ui| {
+                        let mut source_idx = self.source_idx;
+                        let label = self
+                            .devices
+                            .get(source_idx)
+                            .map(|d| d.label.clone())
+                            .unwrap_or_else(|| "(none)".into());
+                        egui::ComboBox::from_id_source("source")
+                            .width(300.0)
+                            .selected_text(label)
+                            .show_ui(ui, |ui| {
+                                for i in 0..self.devices.len() {
+                                    let text = self.devices[i].label.clone();
+                                    ui.selectable_value(&mut source_idx, i, text);
+                                }
+                            });
+                        if source_idx != self.source_idx {
+                            self.source_idx = source_idx;
+                            let sel = self
+                                .devices
+                                .get(source_idx)
+                                .and_then(|d| d.selector.clone());
+                            let lbl = self.devices[source_idx].label.clone();
+                            if let Some(s) = &self.session {
+                                s.set_source(sel);
+                                self.push_log(format!("Source → {lbl}"));
+                            }
+                        }
+                        if ui.button("Refresh").clicked() {
+                            self.refresh_devices();
+                        }
+                    });
+                    ui.end_row();
+
+                    ui.label("Sample rate:");
+                    let mut rate_idx = self.rate_idx;
+                    egui::ComboBox::from_id_source("rate")
+                        .selected_text(self.rate_labels[rate_idx])
+                        .show_ui(ui, |ui| {
+                            for i in 0..self.rate_labels.len() {
+                                ui.selectable_value(&mut rate_idx, i, self.rate_labels[i]);
+                            }
+                        });
+                    if rate_idx != self.rate_idx {
+                        self.rate_idx = rate_idx;
+                        let v = self.rate_values[rate_idx];
+                        if let Some(s) = &self.session {
+                            s.set_target_rate(v);
+                            self.push_log(format!("Wire rate → {}", self.rate_labels[rate_idx]));
+                        }
+                    }
+                    ui.end_row();
+
+                    ui.label("Bit depth:");
+                    let mut depth_idx = self.depth_idx;
+                    egui::ComboBox::from_id_source("depth")
+                        .selected_text(self.depth_labels[depth_idx])
+                        .show_ui(ui, |ui| {
+                            for i in 0..self.depth_labels.len() {
+                                ui.selectable_value(&mut depth_idx, i, self.depth_labels[i]);
+                            }
+                        });
+                    if depth_idx != self.depth_idx {
+                        self.depth_idx = depth_idx;
+                        let v = self.depth_values[depth_idx];
+                        if let Some(s) = &self.session {
+                            s.set_target_depth(v);
+                            self.push_log(format!("Wire depth → {}", self.depth_labels[depth_idx]));
+                        }
+                    }
+                    ui.end_row();
+
+                    ui.label("Volume:");
+                    let mut pct = self.gain * 100.0;
+                    if ui
+                        .add(
+                            egui::Slider::new(&mut pct, 0.0..=200.0)
+                                .suffix("%")
+                                .fixed_decimals(0),
+                        )
+                        .changed()
+                    {
+                        self.gain = pct / 100.0;
+                        if let Some(s) = &self.session {
+                            s.set_gain(self.gain);
+                        }
+                    }
+                    ui.end_row();
+                });
+
+            ui.separator();
+
+            ui.horizontal(|ui| {
+                let running = self.running();
+                let paused = self.paused;
+                let start_label = if running && paused {
+                    "▶  Resume"
+                } else {
+                    "▶  Start"
+                };
+                if ui
+                    .add_enabled(!running || paused, egui::Button::new(start_label))
+                    .clicked()
+                {
+                    if !running {
+                        self.start();
+                    } else {
+                        self.resume();
+                    }
+                }
+                if ui
+                    .add_enabled(running && !paused, egui::Button::new("■  Stop"))
+                    .clicked()
+                {
+                    self.pause();
+                }
+                if running && !paused {
+                    ui.spinner();
+                }
+                if running && paused {
+                    ui.label("paused");
+                }
+            });
+
+            ui.separator();
+            ui.label(format!("Status: {}", self.status));
+            if let Some(f) = self.negotiated {
+                ui.label(format!("Format: {}", f.display_label()));
+            }
+            if self.kbps > 0.0 {
+                ui.label(format!("Throughput: {:.0} kbit/s", self.kbps));
+            }
+
+            ui.separator();
+            ui.label("Log:");
+            egui::ScrollArea::vertical()
+                .max_height(150.0)
+                .auto_shrink([false, false])
+                .show(ui, |ui| {
+                    for line in &self.log {
+                        ui.small(line);
+                    }
+                });
+        });
+
+        // Keep repainting while visible so session stats update; when hidden this stops (the tray
+        // thread handles restore instead).
+        if self.session.is_some() {
+            ctx.request_repaint_after(Duration::from_millis(150));
+        }
+    }
+}
+
+/// Handle tray events on a dedicated thread. While the window is hidden eframe does not run
+/// `update()`, so restoring must not depend on the UI loop.
+fn spawn_tray_thread(
+    ctx: egui::Context,
+    hwnd: Arc<AtomicIsize>,
+    want_start: Arc<AtomicBool>,
+    want_stop: Arc<AtomicBool>,
+) {
+    std::thread::spawn(move || loop {
+        while let Ok(ev) = MenuEvent::receiver().try_recv() {
+            match ev.id.0.as_str() {
+                "show" => restore_window(&ctx, &hwnd),
+                "start" => {
+                    want_start.store(true, Ordering::SeqCst);
+                    restore_window(&ctx, &hwnd);
+                }
+                "stop" => {
+                    want_stop.store(true, Ordering::SeqCst);
+                    restore_window(&ctx, &hwnd);
+                }
+                "quit" => std::process::exit(0),
+                _ => {}
+            }
+        }
+        while let Ok(ev) = TrayIconEvent::receiver().try_recv() {
+            if let TrayIconEvent::Click {
+                button: MouseButton::Left,
+                button_state: MouseButtonState::Up,
+                ..
+            } = ev
+            {
+                restore_window(&ctx, &hwnd);
+            }
+        }
+        std::thread::sleep(Duration::from_millis(50));
+    });
+}
+
+fn restore_window(ctx: &egui::Context, hwnd: &AtomicIsize) {
+    let h = hwnd.load(Ordering::SeqCst);
+    if h != 0 {
+        #[cfg(windows)]
+        show_window_raw(h);
+    }
+    // Wake the UI loop so it resumes repainting (and reconciles the viewport state).
+    ctx.request_repaint();
+}
+
+#[cfg(windows)]
+fn show_window_raw(hwnd: isize) {
+    use std::ffi::c_void;
+    extern "system" {
+        fn ShowWindow(hwnd: *mut c_void, ncmdshow: i32) -> i32;
+        fn SetForegroundWindow(hwnd: *mut c_void) -> i32;
+    }
+    const SW_RESTORE: i32 = 9;
+    unsafe {
+        ShowWindow(hwnd as *mut c_void, SW_RESTORE);
+        SetForegroundWindow(hwnd as *mut c_void);
+    }
+}
+
+/// Build a simple 32x32 tray icon (a green disc) without shipping an asset file.
+fn make_icon() -> tray_icon::Icon {
+    let (w, h) = (32u32, 32u32);
+    let mut rgba = vec![0u8; (w * h * 4) as usize];
+    let c = 15.5f32;
+    let r = 13.5f32;
+    for y in 0..h {
+        for x in 0..w {
+            let dx = x as f32 - c;
+            let dy = y as f32 - c;
+            if (dx * dx + dy * dy).sqrt() <= r {
+                let i = ((y * w + x) * 4) as usize;
+                rgba[i] = 0x2e;
+                rgba[i + 1] = 0xc4;
+                rgba[i + 2] = 0x6b;
+                rgba[i + 3] = 255;
+            }
+        }
+    }
+    tray_icon::Icon::from_rgba(rgba, w, h).expect("valid icon")
+}

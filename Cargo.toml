@@ -14,6 +14,10 @@ license = "MIT"
 name = "aslc_node"
 path = "src/bin/aslc_node.rs"
 
+[[bin]]
+name = "aslc_app"
+path = "src/bin/aslc_app.rs"
+
 [lib]
 name = "aslc"
 path = "src/lib.rs"
@@ -26,6 +30,15 @@ lto = "thin"
 futures-lite = "2"
 nusb = "0.1.14"
 
+# Desktop control window (GUI). Glow/OpenGL renderer + bundled fonts; no wgpu/wayland/x11.
+eframe = { version = "0.27", default-features = false, features = ["default_fonts", "glow"] }
+# System-tray icon so closing the window minimizes instead of quitting.
+tray-icon = "0.24"
+# To grab the window handle for raw ShowWindow (tray restore runs off the UI thread).
+raw-window-handle = "0.6"
+
 # WASAPI loopback capture for the desktop PCM source (Windows only).
 [target.'cfg(windows)'.dependencies]
 wasapi = "0.25"
+# Read the device's MTP/WPD friendly name from the registry (USB descriptors are board strings).
+winreg = "0.56"

@@ -43,6 +43,7 @@ Source: "..\platform\winusb\aslc_aoa.inf"; DestDir: "{app}\driver"; Flags: ignor
 Source: "..\platform\winusb\aslc_aoa.cat"; DestDir: "{app}\driver"; Flags: ignoreversion
 Source: "cert\aslc-node-dev.cer"; DestDir: "{tmp}"; Flags: deleteafterinstall
 Source: "uninstall-driver.ps1"; DestDir: "{tmp}"; Flags: deleteafterinstall
+Source: "clean-driver.ps1"; DestDir: "{tmp}"; Flags: deleteafterinstall
 
 [Icons]
 Name: "{autoprograms}\ASLC Node"; Filename: "{app}\aslc_app.exe"
@@ -53,9 +54,11 @@ Name: "{autoprograms}\ASLC Node - Device Status (CLI)"; Filename: "{sys}\cmd.exe
 ; 1) Trust the catalog signing cert (root + trusted people) - the Zadig trick, done properly in the installer.
 Filename: "{sys}\certutil.exe"; Parameters: "-addstore -f Root ""{tmp}\aslc-node-dev.cer"""; Flags: runhidden; StatusMsg: "Trusting ASLC driver certificate..."
 Filename: "{sys}\certutil.exe"; Parameters: "-addstore -f TrustedPeople ""{tmp}\aslc-node-dev.cer"""; Flags: runhidden; StatusMsg: "Trusting ASLC driver certificate..."
-; 2) Stage + install the driver package (also rebinds a currently connected phone).
+; 2) Remove any previous ASLC AOA package (a stale/unsigned catalog can outrank the new one).
+Filename: "powershell.exe"; Parameters: "-NoProfile -ExecutionPolicy Bypass -File ""{tmp}\clean-driver.ps1"""; Flags: runhidden; StatusMsg: "Removing previous ASLC driver package..."
+; 3) Stage + install the driver package (also rebinds a currently connected phone).
 Filename: "{sys}\pnputil.exe"; Parameters: "/add-driver ""{app}\driver\aslc_aoa.inf"" /install"; Flags: runhidden; StatusMsg: "Installing ASLC USB driver..."
-; 3) Offer to launch the control window.
+; 4) Offer to launch the control window.
 Filename: "{app}\aslc_app.exe"; Description: "Launch ASLC Node"; Flags: nowait postinstall skipifsilent
 
 [UninstallRun]

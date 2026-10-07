@@ -34,11 +34,9 @@ type LoopbackSource = ();
 /// How to locate/attach the phone.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub enum PhoneSelector {
-    /// Try a phone already in accessory mode, else run the AOA handshake on `vid:pid`.
-    Auto { vid: u16, pid: u16 },
-    /// Attach only (phone already enumerates as an accessory).
+    /// Attach to a phone that already enumerates as an AOA accessory.
     Accessory,
-    /// Always run the AOA handshake on `vid:pid` first.
+    /// Run the AOA handshake on this device (its pre-handshake `vid:pid`), then attach.
     Handshake { vid: u16, pid: u16 },
 }
 
@@ -60,10 +58,7 @@ pub struct SessionConfig {
 impl Default for SessionConfig {
     fn default() -> Self {
         Self {
-            phone: PhoneSelector::Auto {
-                vid: 0x18d1,
-                pid: 0x4ee2,
-            },
+            phone: PhoneSelector::Accessory,
             device: None,
             target_rate: None,
             target_depth: None,
@@ -196,25 +191,6 @@ fn open_pipe(sel: &PhoneSelector) -> Result<(AoaTransport, Halves), String> {
             let mut t = AoaTransport::new(*vid, *pid);
             let h = t.open().map_err(|e| format!("AOA handshake failed: {e}"))?;
             Ok((t, h))
-        }
-        PhoneSelector::Auto { vid, pid } => {
-            let has_accessory = nusb::list_devices()
-                .ok()
-                .map(|mut it| it.any(|d| crate::aoa::is_accessory_device(&d)))
-                .unwrap_or(false);
-            if has_accessory {
-                let mut t = AoaTransport::from_attached_accessory();
-                let h = t
-                    .open()
-                    .map_err(|e| format!("accessory present but not openable: {e}"))?;
-                Ok((t, h))
-            } else {
-                let mut t2 = AoaTransport::new(*vid, *pid);
-                let h = t2
-                    .open()
-                    .map_err(|e| format!("phone not found (no accessory, and handshake failed: {e})"))?;
-                Ok((t2, h))
-            }
         }
     }
 }

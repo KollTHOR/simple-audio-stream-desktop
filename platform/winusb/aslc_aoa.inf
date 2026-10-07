@@ -2,13 +2,13 @@
 ; ASLC Node WinUSB device package — installs Microsoft's in-box WinUSB driver
 ; onto the USB interfaces the ASLC desktop node talks to (no vendor binaries).
 ;
-; Sections (by hardware ID):
-;   [PreHandshake]   the phone's normal gadget door (HiBy M300 in file-transfer
-;                    mode: 18d1:4EE1). Binding this replaces the WPD/MTP driver
-;                    for that device ON THIS PC ONLY (other PCs unaffected);
-;                    uninstalling or rolling back restores MTP. Deliberately
-;                    does NOT include 4EE2 (the mtp+adb composite) so enabling
-;                    USB debugging still gives adb its own interface untouched.
+; Fully generic: matches *class/compatible IDs only*, never per-device VID/PIDs.
+;   [PreHandshake]   the generic Android MTP function (USB\MS_COMP_MTP). Binding
+;                    WinUSB to it lets the host send the AOA handshake without
+;                    USB debugging. While installed it replaces the inbox WPD/MTP
+;                    driver for MTP devices ON THIS PC ONLY; the app's "Restore
+;                    file transfer (MTP)" action removes the package to bring
+;                    normal MTP back.
 ;   [Accessory]      the standardized Android AOA accessory interfaces
 ;                    (18d1:2D00/2D01/2D04/2D05, data iface = MI_00 when the
 ;                    accessory composite also carries audio/adb functions).
@@ -29,17 +29,14 @@ PnpLockdown = 1
 %ProviderName% = Standard, NTamd64.10.0...17763
 
 [Standard.NTamd64.10.0...17763]
-; ---- pre-handshake door ----
-; M300 in file-transfer mode is a single-function (non-composite) node -> bare ID is correct.
-%PreHandshake.DeviceDesc% = ASLC_PreHandshake_Install, USB\VID_18D1&PID_4EE1
-%PreHandshake.DeviceDesc% = ASLC_PreHandshake_Install, USB\VID_18D1&PID_4EE1&MI_00
-; Xiaomi 15 in file-transfer mode (2717:FF40). Binding this gives the AOA handshake a claimable
-; interface even when USB debugging is off; it replaces the WPD/MTP driver for this device on this
-; PC only (uninstall/rollback restores MTP). Do NOT add composite PIDs bare (see note below).
-%PreHandshake.DeviceDesc% = ASLC_PreHandshake_Install, USB\VID_2717&PID_FF40
-%PreHandshake.DeviceDesc% = ASLC_PreHandshake_Install, USB\VID_2717&PID_FF40&MI_00
+; ---- generic pre-handshake door (no per-device hardware IDs) ----
+; Bind WinUSB to any Android phone's MTP function so the host can send the AOA handshake without
+; USB debugging and without per-device entries. While installed this replaces the inbox WPD/MTP
+; driver for MTP devices on THIS PC only. The app's "Restore file transfer (MTP)" action removes
+; the package, which returns the phone to normal MTP.
+%PreHandshake.DeviceDesc% = ASLC_PreHandshake_Install, USB\MS_COMP_MTP
 
-; ---- AOA accessory data interface ----
+; ---- AOA accessory data interface (standard AOA protocol IDs, not device-specific) ----
 ; IMPORTANT: match the MI_00 CHILD of composites (2D01/2D04/2D05 carry adb/audio
 ; siblings). Binding the bare PARENT would take the whole composite away from
 ; usbccgp and silently kill adb/audio sibling functions - do NOT add bare parent

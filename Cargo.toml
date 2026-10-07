@@ -18,6 +18,10 @@ path = "src/bin/aslc_node.rs"
 name = "aslc_app"
 path = "src/bin/aslc_app.rs"
 
+[[bin]]
+name = "aslc_driver"
+path = "src/bin/aslc_driver.rs"
+
 [lib]
 name = "aslc"
 path = "src/lib.rs"

@@ -563,11 +563,15 @@ fn run_session_cmd(args: Vec<String>) {
         .and_then(|s| s.parse().ok())
         .unwrap_or(30);
 
+    let phone = match (
+        parse_flag(&args, "--vid").and_then(|s| parse_hex(&s)),
+        parse_flag(&args, "--pid").and_then(|s| parse_hex(&s)),
+    ) {
+        (Some(vid), Some(pid)) => aslc::PhoneSelector::Handshake { vid, pid },
+        _ => aslc::PhoneSelector::Accessory,
+    };
     let cfg = aslc::SessionConfig {
-        phone: aslc::PhoneSelector::Auto {
-            vid: 0x18d1,
-            pid: 0x4ee2,
-        },
+        phone,
         device,
         target_rate: rate,
         target_depth: depth,

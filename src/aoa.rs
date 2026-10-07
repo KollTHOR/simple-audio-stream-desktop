@@ -138,28 +138,10 @@ pub fn find_probe_target() -> Option<(u16, u16)> {
     first
 }
 
-/// Vendor IDs of Android phones/DAPs that can run the AOA accessory. `0x18d1` is Google/Qualcomm
-/// (the M300); the rest are common OEMs whose phones enumerate under their own VID before the
-/// handshake. On Windows an MTP-capable device is also accepted regardless of VID.
-const ANDROID_VIDS: &[u16] = &[
-    0x18d1, // Google / Qualcomm (HiBy M300)
-    0x2717, // Xiaomi
-    0x04e8, // Samsung
-    0x12d1, // Huawei
-    0x2a70, // OnePlus
-    0x22d9, // Oppo / Realme
-    0x2d95, // Vivo
-    0x22b8, // Motorola
-    0x0bb4, // HTC
-    0x1004, // LG
-    0x2916, // Nothing
-    0x2207, // Rockchip (some DAPs)
-];
-
-/// True if the device publishes an MTP-compatible interface (so it's most likely an Android
-/// phone/DAP), read from the Windows registry's `CompatibleIDs`. Vendor-agnostic.
+/// True if the device advertises any of `needles` in its Windows registry `CompatibleIDs`.
+/// Vendor-agnostic: the strings checked are Microsoft/Android *class* IDs, never device IDs.
 #[cfg(windows)]
-fn registry_is_mtp(vid: u16, pid: u16) -> bool {
+fn registry_compatible_has(vid: u16, pid: u16, needles: &[&str]) -> bool {
     use winreg::enums::HKEY_LOCAL_MACHINE;
     use winreg::RegKey;
 
@@ -180,7 +162,7 @@ fn registry_is_mtp(vid: u16, pid: u16) -> bool {
                 continue;
             };
             if let Ok(ids) = sub.get_value::<Vec<String>, _>("CompatibleIDs") {
-                if ids.iter().any(|s| s.contains("MS_COMP_MTP")) {
+                if ids.iter().any(|s| needles.iter().any(|n| s.contains(n))) {
                     return true;
                 }
             }
@@ -190,8 +172,20 @@ fn registry_is_mtp(vid: u16, pid: u16) -> bool {
 }
 
 #[cfg(not(windows))]
-fn registry_is_mtp(_vid: u16, _pid: u16) -> bool {
+fn registry_compatible_has(_vid: u16, _pid: u16, _needles: &[&str]) -> bool {
     false
+}
+
+/// Android's MTP function (`USB\MS_COMP_MTP`) — present on essentially every phone without USB
+/// debugging. This is the interface we bind WinUSB to so the host can send the AOA handshake.
+fn registry_is_mtp(vid: u16, pid: u16) -> bool {
+    registry_compatible_has(vid, pid, &["MS_COMP_MTP"])
+}
+
+/// Android's ADB function (`USB\Class_ff&SubClass_42&Prot_01` / `USB\MS_COMP_ADB`) — present when
+/// USB debugging is on. Windows already binds WinUSB to it, so it needs no driver from us.
+fn registry_is_adb(vid: u16, pid: u16) -> bool {
+    registry_compatible_has(vid, pid, &["SubClass_42", "MS_COMP_ADB"])
 }
 
 /// A candidate ASLC receiver: a phone/DAP that can run the AOA accessory.
@@ -218,7 +212,7 @@ impl ReceiverDevice {
 }
 
 /// Read the device's real name from the Windows registry. Explorer/File Manager shows the MTP
-/// (WPD) device's name — e.g. "HiBy M300" — which the registry stores as `DeviceDesc`/`Mfg` on the
+/// (WPD) device's name, which the registry stores as `DeviceDesc`/`Mfg` on the
 /// `...\Enum\USB\VID_xxxx&PID_yyyy&MI_00` key. That key persists after the phone switches to
 /// accessory mode, so this also names an already-attached accessory.
 #[cfg(windows)]
@@ -276,9 +270,9 @@ pub fn list_receiver_devices() -> Vec<ReceiverDevice> {
             let vid = d.vendor_id();
             let pid = d.product_id();
             let accessory = is_accessory_device(&d);
-            let candidate = accessory
-                || ANDROID_VIDS.contains(&vid)
-                || registry_is_mtp(vid, pid);
+            // Capability-based (no vendor/device IDs): AOA accessory, Android MTP function, or
+            // Android ADB function — all Microsoft/Android *class* IDs the phone itself publishes.
+            let candidate = accessory || registry_is_mtp(vid, pid) || registry_is_adb(vid, pid);
             if !candidate {
                 continue;
             }
@@ -768,7 +762,7 @@ mod tests {
                 "bad AOA string {s:?}"
             );
         }
-        // Non-empty URI hijacks attach dispatch into the SystemUI URI chooser (verified on M300).
+        // Non-empty URI hijacks attach dispatch into the SystemUI URI chooser (verified on real hardware).
         assert!(AOA_URI.is_empty(), "URI slot must stay empty");
         // Kernel string-slot mapping must not drift: 3=version, 4=uri, 5=serial.
         assert_eq!(

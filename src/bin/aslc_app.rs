@@ -183,10 +183,7 @@ impl AslcApp {
                 vid: r.vid,
                 pid: r.pid,
             },
-            None => PhoneSelector::Auto {
-                vid: 0x18d1,
-                pid: 0x4ee2,
-            },
+            None => PhoneSelector::Accessory,
         }
     }
 
@@ -299,6 +296,45 @@ impl AslcApp {
             s.resume();
         }
         self.status = "Resuming…".into();
+    }
+
+    fn driver_exe() -> Option<std::path::PathBuf> {
+        std::env::current_exe()
+            .ok()
+            .and_then(|p| p.parent().map(|d| d.join("aslc_driver.exe")))
+    }
+
+    /// Install the generic ASLC USB driver (elevated). Needed to talk to a phone without USB
+    /// debugging; hides MTP while installed.
+    fn install_driver(&mut self) {
+        let Some(exe) = Self::driver_exe() else {
+            self.push_log("aslc_driver.exe not found next to the app".into());
+            return;
+        };
+        let args = std::env::current_exe()
+            .ok()
+            .and_then(|p| p.parent().map(|d| d.join("driver").join("aslc_aoa.inf")))
+            .filter(|p| p.exists())
+            .map(|p| format!("install --inf \"{}\"", p.display()))
+            .unwrap_or_else(|| "install".to_string());
+        if run_elevated(&exe, &args) {
+            self.push_log("Installing ASLC USB driver — approve the UAC prompt".into());
+        } else {
+            self.push_log("Driver install cancelled".into());
+        }
+    }
+
+    /// Remove the ASLC USB driver so Windows re-binds the inbox MTP driver (file transfer returns).
+    fn restore_mtp(&mut self) {
+        let Some(exe) = Self::driver_exe() else {
+            self.push_log("aslc_driver.exe not found next to the app".into());
+            return;
+        };
+        if run_elevated(&exe, "remove") {
+            self.push_log("Restoring file transfer (MTP) — approve the UAC prompt".into());
+        } else {
+            self.push_log("Restore MTP cancelled".into());
+        }
     }
 }
 
@@ -503,6 +539,17 @@ impl eframe::App for AslcApp {
             });
 
             ui.separator();
+            ui.horizontal(|ui| {
+                ui.label("USB driver (Windows):");
+                if ui.button("Install ASLC driver").clicked() {
+                    self.install_driver();
+                }
+                if ui.button("Restore file transfer (MTP)").clicked() {
+                    self.restore_mtp();
+                }
+            });
+
+            ui.separator();
             ui.label(format!("Status: {}", self.status));
             if let Some(f) = self.negotiated {
                 ui.label(format!("Format: {}", f.display_label()));
@@ -577,6 +624,48 @@ fn restore_window(ctx: &egui::Context, hwnd: &AtomicIsize) {
     }
     // Wake the UI loop so it resumes repainting (and reconciles the viewport state).
     ctx.request_repaint();
+}
+
+#[cfg(windows)]
+#[link(name = "shell32")]
+extern "system" {
+    fn ShellExecuteW(
+        hwnd: *mut std::ffi::c_void,
+        op: *const u16,
+        file: *const u16,
+        params: *const u16,
+        dir: *const u16,
+        nshow: i32,
+    ) -> *mut std::ffi::c_void;
+}
+
+/// Launch `exe` elevated (UAC) with `args`. Returns false if the user declined.
+#[cfg(windows)]
+fn run_elevated(exe: &std::path::Path, args: &str) -> bool {
+    use std::ffi::OsStr;
+    use std::os::windows::ffi::OsStrExt;
+    fn wide(s: &OsStr) -> Vec<u16> {
+        s.encode_wide().chain(std::iter::once(0)).collect()
+    }
+    let op = wide(OsStr::new("runas"));
+    let file = wide(exe.as_os_str());
+    let params = wide(OsStr::new(args));
+    let h = unsafe {
+        ShellExecuteW(
+            std::ptr::null_mut(),
+            op.as_ptr(),
+            file.as_ptr(),
+            params.as_ptr(),
+            std::ptr::null(),
+            1,
+        )
+    };
+    (h as isize) > 32
+}
+
+#[cfg(not(windows))]
+fn run_elevated(_exe: &std::path::Path, _args: &str) -> bool {
+    false
 }
 
 #[cfg(windows)]

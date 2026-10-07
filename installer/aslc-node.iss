@@ -38,6 +38,7 @@ Name: "desktopicon"; Description: "Create a desktop shortcut"; GroupDescription:
 
 [Files]
 Source: "..\target\release\aslc_app.exe"; DestDir: "{app}"; Flags: ignoreversion
+Source: "..\target\release\aslc_driver.exe"; DestDir: "{app}"; Flags: ignoreversion
 Source: "..\target\release\aslc_node.exe"; DestDir: "{app}"; Flags: ignoreversion
 Source: "..\platform\winusb\aslc_aoa.inf"; DestDir: "{app}\driver"; Flags: ignoreversion
 Source: "..\platform\winusb\aslc_aoa.cat"; DestDir: "{app}\driver"; Flags: ignoreversion

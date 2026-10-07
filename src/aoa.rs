@@ -308,6 +308,11 @@ fn wpd_name_for(
             return Some(n.clone());
         }
     }
+    // Any WPD entry for this VID/PID (e.g. the `&MI_00` MTP node) — names the phone even after our
+    // driver replaced its PnP name with ours.
+    if let Some((_, n)) = names.iter().find(|(k, _)| k.starts_with(&exact)) {
+        return Some(n.clone());
+    }
     if accessory {
         if let Some((_, n)) = names.iter().find(|(k, _)| {
             k.starts_with("USB#VID_18D1&PID_")

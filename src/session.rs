@@ -475,6 +475,30 @@ fn run_session(
         }
 
         // --- Streaming -----------------------------------------------------------------
+        // Detect a phone-side restart: when the receiver is stopped and started again it re-sends
+        // HELLO/CAPABILITIES on the same pipe (the accessory connection persists). If we keep
+        // streaming blindly, both sides end up stuck. Renegotiate instead.
+        let mut restarted = false;
+        let mut reader_dead = false;
+        while let Ok(ev) = irx.try_recv() {
+            match ev {
+                Ok(Inbound::Hello(_))
+                | Ok(Inbound::Capabilities(_))
+                | Ok(Inbound::Error(_)) => restarted = true,
+                Ok(Inbound::ConfigureAck(_)) => {}
+                Err(_) => reader_dead = true,
+            }
+        }
+        if reader_dead {
+            emit(SessionEvent::Error("device disconnected".into()));
+            break;
+        }
+        if restarted {
+            streaming = false;
+            emit(SessionEvent::State("Phone reconnected — renegotiating…".into()));
+            continue;
+        }
+
         if let Some(msg) =
             switch_source_if_needed(&source, &mut applied_source, &mut loopback, &mut follow_check)
         {

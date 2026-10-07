@@ -261,9 +261,73 @@ fn registry_device_name(vid: u16, pid: Option<u16>) -> Option<String> {
     None
 }
 
-/// Enumerate AOA-capable receivers: devices already in accessory mode, plus Google-VID (`0x18d1`)
-/// Android/DAP devices that a handshake can switch into accessory mode.
+/// Windows' WPD (portable devices) store remembers the real friendly name of every phone that has
+/// been enumerated — even after our driver replaces the MTP driver, which overwrites the PnP name.
+/// Returns `(instance key uppercased, friendly name)` pairs.
+#[cfg(windows)]
+fn wpd_names() -> Vec<(String, String)> {
+    use winreg::enums::HKEY_LOCAL_MACHINE;
+    use winreg::RegKey;
+
+    let hklm = RegKey::predef(HKEY_LOCAL_MACHINE);
+    let Ok(root) = hklm.open_subkey("SOFTWARE\\Microsoft\\Windows Portable Devices\\Devices") else {
+        return Vec::new();
+    };
+    let mut out = Vec::new();
+    for key in root.enum_keys().flatten() {
+        if let Ok(sub) = root.open_subkey(&key) {
+            if let Ok(name) = sub.get_value::<String, _>("FriendlyName") {
+                let n = name.trim().to_string();
+                if !n.is_empty() {
+                    out.push((key.to_uppercase(), n));
+                }
+            }
+        }
+    }
+    out
+}
+
+/// Resolve a friendly name from the WPD store: exact device key, then by USB serial anywhere, then
+/// (for an AOA accessory) the phone's own MTP node, which shares Google's VID but a different PID.
+#[cfg(windows)]
+fn wpd_name_for(
+    names: &[(String, String)],
+    vid: u16,
+    pid: u16,
+    serial: &str,
+    accessory: bool,
+) -> Option<String> {
+    let exact = format!("USB#VID_{vid:04X}&PID_{pid:04X}");
+    if !serial.is_empty() {
+        let want = format!("{exact}#{}", serial.to_uppercase());
+        if let Some((_, n)) = names.iter().find(|(k, _)| *k == want) {
+            return Some(n.clone());
+        }
+        let tag = format!("#{}", serial.to_uppercase());
+        if let Some((_, n)) = names.iter().find(|(k, _)| k.contains(&tag)) {
+            return Some(n.clone());
+        }
+    }
+    if accessory {
+        if let Some((_, n)) = names.iter().find(|(k, _)| {
+            k.starts_with("USB#VID_18D1&PID_")
+                && !k.starts_with("USB#VID_18D1&PID_2D")
+                && !k.starts_with("USB#VID_18D1&PID_4E1")
+        }) {
+            return Some(n.clone());
+        }
+    }
+    None
+}
+
+/// Enumerate AOA-capable receivers (capability-based, no vendor/device IDs): devices already in
+/// accessory mode, plus Android devices advertising an MTP or ADB function.
 pub fn list_receiver_devices() -> Vec<ReceiverDevice> {
+    #[cfg(windows)]
+    let wpd = wpd_names();
+    #[cfg(not(windows))]
+    let wpd: Vec<(String, String)> = Vec::new();
+
     let mut out = Vec::new();
     if let Ok(devs) = nusb::list_devices() {
         for d in devs {
@@ -285,11 +349,17 @@ pub fn list_receiver_devices() -> Vec<ReceiverDevice> {
                 None => (p, ""),
             };
             let descriptor_name = format!("{m} {p_clean}").trim().to_string();
-            // Prefer the device's real MTP/WPD name (what Explorer/File Manager shows); the USB
-            // descriptor strings are often just a board id. The VID-wide fallback is only for
-            // accessory-mode devices, whose MTP PID differs from the one we saw at handshake time.
+            let serial = if !embedded_sn.is_empty() {
+                embedded_sn.to_string()
+            } else {
+                d.serial_number().unwrap_or("").trim().to_string()
+            };
+            // Prefer the phone's real name from Windows' WPD store (names the accessory, whose own
+            // descriptor is generic); then the PnP name Windows has for this VID/PID; then the raw
+            // descriptors.
             #[cfg(windows)]
-            let name = registry_device_name(vid, Some(pid))
+            let name = wpd_name_for(&wpd, vid, pid, &serial, accessory)
+                .or_else(|| registry_device_name(vid, Some(pid)))
                 .or_else(|| {
                     if accessory {
                         registry_device_name(vid, None)
@@ -300,11 +370,6 @@ pub fn list_receiver_devices() -> Vec<ReceiverDevice> {
                 .unwrap_or(descriptor_name);
             #[cfg(not(windows))]
             let name = descriptor_name;
-            let serial = if !embedded_sn.is_empty() {
-                embedded_sn.to_string()
-            } else {
-                d.serial_number().unwrap_or("").trim().to_string()
-            };
             out.push(ReceiverDevice {
                 vid,
                 pid,

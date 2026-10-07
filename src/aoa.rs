@@ -478,8 +478,9 @@ fn io_other(msg: impl Into<String>) -> AslcError {
 fn discover_bulk_interface(dev: &Device) -> Result<(Interface, u8, u8), AslcError> {
     let iface = dev.detach_and_claim_interface(0).map_err(|e| {
         io_other(format!(
-            "accessory data interface 0 not claimable ({e}) - on Windows install the WinUSB \
-             driver: pnputil /add-driver platform\\winusb\\aslc_aoa.inf /install"
+            "accessory data interface 0 not claimable ({e}) - install the ASLC USB driver \
+             (app: 'Install ASLC driver'), or enable USB debugging on the phone so Windows binds \
+             the ADB interface automatically"
         ))
     })?;
     let mut in_ep = None;
@@ -659,7 +660,9 @@ impl Transport for AoaTransport {
             }
             let iface = claimed.ok_or_else(|| {
                 io_other(format!(
-                    "no WinUSB-bound interface to claim -> {}",
+                    "no claimable USB interface on the phone -> {}. Install the ASLC USB driver \
+                     (app: 'Install ASLC driver'), or enable USB debugging on the phone so Windows \
+                     binds the ADB interface automatically",
                     claim_errs.join(" | ")
                 ))
             })?;

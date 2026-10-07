@@ -1,0 +1,4 @@
+# Link the C runtime statically so the release binaries are fully self-contained and run on a
+# clean Windows install without the Visual C++ redistributable (no vcruntime140.dll dependency).
+[target.x86_64-pc-windows-msvc]
+rustflags = ["-C", "target-feature=+crt-static"]

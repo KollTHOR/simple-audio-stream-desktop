@@ -58,6 +58,7 @@ Filename: "{sys}\certutil.exe"; Parameters: "-addstore -f TrustedPeople ""{tmp}\
 Filename: "powershell.exe"; Parameters: "-NoProfile -ExecutionPolicy Bypass -File ""{tmp}\clean-driver.ps1"""; Flags: runhidden; StatusMsg: "Removing previous ASLC driver package..."
 ; 3) Stage + install the driver package (also rebinds a currently connected phone).
 Filename: "{sys}\pnputil.exe"; Parameters: "/add-driver ""{app}\driver\aslc_aoa.inf"" /install"; Flags: runhidden; StatusMsg: "Installing ASLC USB driver..."
+Filename: "{sys}\pnputil.exe"; Parameters: "/scan-devices"; Flags: runhidden; StatusMsg: "Rescanning USB devices..."
 ; 4) Offer to launch the control window.
 Filename: "{app}\aslc_app.exe"; Description: "Launch ASLC Node"; Flags: nowait postinstall skipifsilent
 

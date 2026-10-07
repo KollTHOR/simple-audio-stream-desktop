@@ -292,10 +292,17 @@ pub fn list_receiver_devices() -> Vec<ReceiverDevice> {
             };
             let descriptor_name = format!("{m} {p_clean}").trim().to_string();
             // Prefer the device's real MTP/WPD name (what Explorer/File Manager shows); the USB
-            // descriptor strings are often just a board id.
+            // descriptor strings are often just a board id. The VID-wide fallback is only for
+            // accessory-mode devices, whose MTP PID differs from the one we saw at handshake time.
             #[cfg(windows)]
             let name = registry_device_name(vid, Some(pid))
-                .or_else(|| registry_device_name(vid, None))
+                .or_else(|| {
+                    if accessory {
+                        registry_device_name(vid, None)
+                    } else {
+                        None
+                    }
+                })
                 .unwrap_or(descriptor_name);
             #[cfg(not(windows))]
             let name = descriptor_name;

@@ -618,6 +618,7 @@ impl AoaTransport {
     fn wait_for_accessory(&mut self) -> Result<(Interface, u8, u8), AslcError> {
         let deadline = Instant::now() + Duration::from_secs(20);
         let mut announced = false;
+        let mut last_err: Option<String> = None;
         loop {
             if let Some(dev) = Self::find_device(is_accessory_device) {
                 if !announced {
@@ -628,18 +629,25 @@ impl AoaTransport {
                     announced = true;
                 }
                 match dev.open() {
-                    Ok(device) => {
-                        return discover_bulk_interface(&device);
-                    }
+                    Ok(device) => match discover_bulk_interface(&device) {
+                        Ok(v) => return Ok(v),
+                        // The data interface can be briefly un-claimable: the phone's app must
+                        // grant the accessory permission and Windows has to settle the new node.
+                        // Retry until the deadline instead of failing — that used to force a manual
+                        // Stop/Start on the phone.
+                        Err(e) => last_err = Some(e.to_string()),
+                    },
                     // open() can transiently fail mid re-enumeration; keep polling until the deadline.
-                    Err(_) if Instant::now() < deadline => {}
-                    Err(e) => return Err(io_other(format!("accessory open failed: {e}"))),
+                    Err(e) => last_err = Some(format!("accessory open failed: {e}")),
                 }
             }
             if Instant::now() >= deadline {
-                return Err(io_other("timed out waiting for accessory mode"));
+                return Err(io_other(match last_err {
+                    Some(e) => format!("timed out waiting for accessory mode: {e}"),
+                    None => "timed out waiting for accessory mode".into(),
+                }));
             }
-            std::thread::sleep(Duration::from_millis(100));
+            std::thread::sleep(Duration::from_millis(200));
         }
     }
 }

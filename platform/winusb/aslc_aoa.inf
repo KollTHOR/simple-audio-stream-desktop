@@ -53,6 +53,12 @@ PnpLockdown = 1
 Include = winusb.inf
 Needs   = WINUSB.NT
 
+; DeviceInterfaceGUIDs must be registered for WinUSB clients (nusb) to open the interface. It
+; belongs in the device's .HW section (the hardware key); the .Services AddReg below was NOT
+; applied on real installs, which left the door unopenable.
+[ASLC_PreHandshake_Install.HW]
+AddReg  = ASLC_Guid.AddReg
+
 [ASLC_PreHandshake_Install.Services]
 Include = winusb.inf
 AddReg  = ASLC_Guid.AddReg
@@ -61,6 +67,9 @@ Needs   = WINUSB.NT.Services
 [ASLC_Accessory_Install]
 Include = winusb.inf
 Needs   = WINUSB.NT
+
+[ASLC_Accessory_Install.HW]
+AddReg  = ASLC_Guid.AddReg
 
 [ASLC_Accessory_Install.Services]
 Include = winusb.inf

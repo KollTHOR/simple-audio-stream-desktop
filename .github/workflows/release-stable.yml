@@ -1,0 +1,104 @@
+name: Release Stable
+
+on:
+  push:
+    tags:
+      - 'v[0-9]+.[0-9]+.[0-9]+*'
+  workflow_dispatch:
+    inputs:
+      tag_name:
+        description: 'Release Tag (e.g. v0.2.0)'
+        required: true
+
+concurrency:
+  group: release-pipeline
+  cancel-in-progress: false
+
+permissions:
+  contents: write
+
+jobs:
+  build-and-release-stable:
+    runs-on: windows-latest
+
+    steps:
+      - name: Checkout Code
+        uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: '3.x'
+
+      - name: Install Rust toolchain
+        uses: dtolnay/rust-toolchain@stable
+
+      - name: Cache cargo
+        uses: Swatinem/rust-cache@v2
+
+      - name: Run Unit Tests
+        run: cargo test --release
+
+      - name: Resolve and Validate Release Version Metadata
+        id: version_meta
+        shell: bash
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          TAG="${{ github.event.inputs.tag_name || github.ref_name }}"
+          python .github/scripts/resolve_version.py --channel stable --tag "$TAG" --run-number ${{ github.run_number }}
+
+      - name: Build Release Binaries
+        shell: bash
+        env:
+          SOURCE_DATE_EPOCH: ${{ steps.version_meta.outputs.commit_epoch }}
+        run: cargo build --release
+
+      - name: Install Inno Setup
+        run: choco install innosetup --no-progress -y
+
+      - name: Build Installer
+        shell: pwsh
+        run: |
+          & "C:\Program Files (x86)\Inno Setup 6\ISCC.exe" "/DMyAppVersion=${{ steps.version_meta.outputs.version_name }}" installer\aslc-node.iss
+          if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
+
+      - name: Prepare Release Assets
+        id: prepare_assets
+        shell: bash
+        run: |
+          set -euo pipefail
+          SRC="installer/output/ASLC-Node-Setup-${{ steps.version_meta.outputs.version_name }}.exe"
+          TARGET="${{ steps.version_meta.outputs.installer_name }}"
+          test -f "$SRC"
+          cp "$SRC" "$TARGET"
+          sha256sum "$TARGET" | awk '{print $1}' > "$TARGET.sha256"
+          echo "checksum=$(cat $TARGET.sha256)" >> "$GITHUB_OUTPUT"
+
+      - name: Publish GitHub Release
+        uses: softprops/action-gh-release@v2
+        with:
+          tag_name: ${{ steps.version_meta.outputs.tag_name }}
+          name: ${{ steps.version_meta.outputs.release_title }}
+          body: |
+            ### Release ${{ steps.version_meta.outputs.tag_name }}
+
+            - **Version:** `${{ steps.version_meta.outputs.version_name }}`
+            - **Build:** `${{ steps.version_meta.outputs.version_code }}`
+            - **Commit:** `${{ steps.version_meta.outputs.commit_sha }}`
+            - **Channel:** `Stable`
+            - **SHA-256 Checksum:** `${{ steps.prepare_assets.outputs.checksum }}`
+
+            The desktop app can install this in place from **Check for updates**.
+
+            <!-- metadata: channel=stable commit=${{ steps.version_meta.outputs.commit_sha }} versionCode=${{ steps.version_meta.outputs.version_code }} versionName=${{ steps.version_meta.outputs.version_name }} -->
+          files: |
+            ${{ steps.version_meta.outputs.installer_name }}
+            ${{ steps.version_meta.outputs.sha_name }}
+          draft: false
+          prerelease: false
+          generate_release_notes: true
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}

@@ -56,7 +56,7 @@ struct DeviceItem {
 
 /// The full wire-rate menu; entries above what the phone advertises are filtered out at runtime.
 const RATE_CHOICES: [(&str, Option<u32>); 7] = [
-    ("Native (follow source)", None),
+    ("Native (device best)", None),
     ("44.1 kHz", Some(44_100)),
     ("48 kHz", Some(48_000)),
     ("88.2 kHz", Some(88_200)),
@@ -67,7 +67,7 @@ const RATE_CHOICES: [(&str, Option<u32>); 7] = [
 
 /// The full bit-depth menu; filtered like `RATE_CHOICES`.
 const DEPTH_CHOICES: [(&str, Option<u8>); 4] = [
-    ("Native", None),
+    ("Native (device best)", None),
     ("16-bit", Some(16)),
     ("24-bit", Some(24)),
     ("32-bit", Some(32)),
@@ -237,6 +237,27 @@ impl AslcApp {
 
     fn running(&self) -> bool {
         self.session.is_some()
+    }
+
+    /// The phone's "best" wire format for a Native selection: its reported native output rate when
+    /// known (so it plays without resampling), else the highest rate it advertises; and its highest
+    /// advertised bit depth. `None` until the capability probe has run.
+    fn device_best_format(&self) -> (Option<u32>, Option<u8>) {
+        let rate = match (&self.caps, &self.device_audio) {
+            (Some(caps), Some(ai))
+                if ai.output_sample_rate > 0
+                    && caps.sample_rates.contains(&ai.output_sample_rate) =>
+            {
+                Some(ai.output_sample_rate)
+            }
+            (Some(caps), _) => caps.sample_rates.iter().copied().max(),
+            _ => None,
+        };
+        let depth = self
+            .caps
+            .as_ref()
+            .and_then(|c| c.bit_depths.iter().copied().max());
+        (rate, depth)
     }
 
     fn refresh_receivers(&mut self) {
@@ -622,11 +643,27 @@ impl AslcApp {
             .devices
             .get(self.source_idx)
             .and_then(|d| d.selector.clone());
+        // Native means "let the phone pick its best": resolve it from the device's report.
+        let (best_rate, best_depth) = self.device_best_format();
+        let target_rate = self.rate_values[self.rate_idx].or(best_rate);
+        let target_depth = self.depth_values[self.depth_idx].or(best_depth);
+        if self.rate_values[self.rate_idx].is_none() {
+            self.push_log(match target_rate {
+                Some(r) => format!("Native rate → device best {r} Hz"),
+                None => "Native rate → follow source (no device report yet)".into(),
+            });
+        }
+        if self.depth_values[self.depth_idx].is_none() {
+            self.push_log(match target_depth {
+                Some(d) => format!("Native depth → device best {d}-bit"),
+                None => "Native depth → follow source (no device report yet)".into(),
+            });
+        }
         let cfg = SessionConfig {
             phone,
             device,
-            target_rate: self.rate_values[self.rate_idx],
-            target_depth: self.depth_values[self.depth_idx],
+            target_rate,
+            target_depth,
             gain: self.gain,
             tone: false,
             wait_secs: 30,
@@ -728,7 +765,12 @@ impl eframe::App for AslcApp {
         // Phones can be plugged in (or switched to MTP) after launch: keep the list fresh.
         if self.last_receiver_refresh.elapsed() >= Duration::from_secs(2) {
             self.last_receiver_refresh = Instant::now();
+            let before = self.receivers.len();
             self.refresh_receivers();
+            if before == 0 && !self.receivers.is_empty() {
+                // A phone just appeared: learn its capabilities so "Native" can use its best.
+                self.start_probe();
+            }
         }
 
         self.poll();
@@ -860,10 +902,17 @@ impl eframe::App for AslcApp {
                     if rate_idx != self.rate_idx {
                         self.rate_idx = rate_idx;
                         let v = self.rate_values[rate_idx];
+                        let applied = v.or_else(|| self.device_best_format().0);
+                        let label = match (v, applied) {
+                            (None, Some(r)) => {
+                                format!("{} → {} Hz", self.rate_labels[rate_idx], r)
+                            }
+                            _ => self.rate_labels[rate_idx].to_string(),
+                        };
                         if let Some(s) = &self.session {
-                            s.set_target_rate(v);
-                            self.push_log(format!("Wire rate → {}", self.rate_labels[rate_idx]));
+                            s.set_target_rate(applied);
                         }
+                        self.push_log(format!("Wire rate → {label}"));
                     }
                     ui.end_row();
 
@@ -879,10 +928,17 @@ impl eframe::App for AslcApp {
                     if depth_idx != self.depth_idx {
                         self.depth_idx = depth_idx;
                         let v = self.depth_values[depth_idx];
+                        let applied = v.or_else(|| self.device_best_format().1);
+                        let label = match (v, applied) {
+                            (None, Some(d)) => {
+                                format!("{} → {}-bit", self.depth_labels[depth_idx], d)
+                            }
+                            _ => self.depth_labels[depth_idx].to_string(),
+                        };
                         if let Some(s) = &self.session {
-                            s.set_target_depth(v);
-                            self.push_log(format!("Wire depth → {}", self.depth_labels[depth_idx]));
+                            s.set_target_depth(applied);
                         }
+                        self.push_log(format!("Wire depth → {label}"));
                     }
                     ui.end_row();
 

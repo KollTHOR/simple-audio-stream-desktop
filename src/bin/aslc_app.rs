@@ -35,8 +35,8 @@ use aslc::{capabilities::PcmCapabilities, PcmFormat};
 fn main() -> eframe::Result<()> {
     let options = eframe::NativeOptions {
         viewport: egui::ViewportBuilder::default()
-            .with_inner_size([540.0, 600.0])
-            .with_min_inner_size([460.0, 420.0])
+            .with_inner_size([560.0, 720.0])
+            .with_min_inner_size([420.0, 560.0])
             .with_title("ASLC Node"),
         ..Default::default()
     };
@@ -96,11 +96,29 @@ enum UpdateMsg {
 
 /// Top-level pages of the control window.
 #[derive(Default, PartialEq, Eq, Clone, Copy)]
-enum Tab {
+enum Page {
     #[default]
-    Main,
+    Home,
     Settings,
-    Logs,
+    Advanced,
+    Diagnostics,
+}
+
+/// The user-facing connection state — drives the status pill and the primary button.
+#[derive(PartialEq, Eq, Clone, Copy)]
+enum ConnState {
+    /// No phone is connected.
+    NoDevice,
+    /// A phone is connected and ready to stream.
+    Ready,
+    /// Opening the link / negotiating format.
+    Connecting,
+    /// Streaming audio.
+    Streaming,
+    /// Streaming, but paused.
+    Paused,
+    /// Something went wrong.
+    Error,
 }
 
 struct AslcApp {
@@ -132,7 +150,9 @@ struct AslcApp {
     update_auto_checked: bool,
 
     /// Selected page.
-    tab: Tab,
+    page: Page,
+    /// Last error (cleared on Start) — drives the Home error state.
+    error: Option<String>,
     /// Learned device names, keyed by USB serial (the phone reports its name in HELLO).
     known_names: std::collections::HashMap<String, String>,
     /// Last time the receiver list was refreshed (phones can be plugged in after launch).
@@ -164,6 +184,7 @@ struct AslcApp {
 
 impl AslcApp {
     fn new(cc: &eframe::CreationContext<'_>) -> Self {
+        apply_theme(&cc.egui_ctx);
         let mut app = Self {
             receivers: Vec::new(),
             receiver_idx: 0,
@@ -181,7 +202,8 @@ impl AslcApp {
             update_state: UpdateState::Idle,
             update_rx: None,
             update_auto_checked: false,
-            tab: Tab::Main,
+            page: Page::Home,
+            error: None,
             known_names: load_known_names(),
             last_receiver_refresh: Instant::now(),
             driver_installed: None,
@@ -278,23 +300,6 @@ impl AslcApp {
                 .unwrap_or(0),
             None => 0,
         };
-    }
-
-    fn receiver_display(&self, r: &ReceiverDevice) -> String {
-        let name = match self.known_names.get(&r.serial) {
-            Some(n) if !n.trim().is_empty() => n.clone(),
-            _ => r.default_label(),
-        };
-        let id = if r.serial.is_empty() {
-            String::new()
-        } else {
-            format!("  ·  {}", r.serial)
-        };
-        if r.accessory {
-            format!("{name}{id}  · ready")
-        } else {
-            format!("{name}{id}")
-        }
     }
 
     /// Remember the phone's self-reported name for the currently selected receiver (by serial) and
@@ -422,6 +427,7 @@ impl AslcApp {
                 SessionEvent::Error(e) => {
                     self.status = format!("Error: {e}");
                     self.push_log(format!("Error: {e}"));
+                    self.error = Some(e);
                     self.terminal = true;
                 }
             }
@@ -706,6 +712,7 @@ impl AslcApp {
             wait_secs: 30,
         };
         self.status = "Starting…".into();
+        self.error = None;
         self.negotiated = None;
         self.kbps = 0.0;
         self.latency = None;
@@ -765,6 +772,535 @@ impl AslcApp {
         } else {
             self.push_log("Restore MTP cancelled".into());
         }
+    }
+
+    // ---- Presentation -----------------------------------------------------------------------
+
+    /// The user-facing connection state (drives the pill and the primary button).
+    fn conn_state(&self) -> ConnState {
+        if self.error.is_some() {
+            return ConnState::Error;
+        }
+        if self.session.is_none() {
+            return if self.receivers.is_empty() {
+                ConnState::NoDevice
+            } else {
+                ConnState::Ready
+            };
+        }
+        if self.paused {
+            return ConnState::Paused;
+        }
+        if self.negotiated.is_none() {
+            return ConnState::Connecting;
+        }
+        ConnState::Streaming
+    }
+
+    /// The selected source's friendly label.
+    fn source_label(&self) -> String {
+        self.devices
+            .get(self.source_idx)
+            .map(|d| d.label.clone())
+            .unwrap_or_else(|| "System default".into())
+    }
+
+    /// The receiver's friendly name at `i` — the learned name, else the descriptor, else a plain
+    /// "Android phone". Never the raw `VID:PID`.
+    fn receiver_name_at(&self, i: usize) -> String {
+        match self.receivers.get(i) {
+            Some(r) => match self.known_names.get(&r.serial) {
+                Some(n) if !n.trim().is_empty() => n.clone(),
+                _ if !r.name.trim().is_empty() => r.name.clone(),
+                _ => "Android phone".into(),
+            },
+            None => "No device".into(),
+        }
+    }
+
+    fn receiver_label(&self) -> String {
+        self.receiver_name_at(self.receiver_idx)
+    }
+
+    /// "48 kHz · 24-bit" for the negotiated format.
+    fn format_summary(&self) -> Option<String> {
+        self.negotiated.map(|f| {
+            format!(
+                "{:.0} kHz · {}-bit",
+                f.sample_rate as f32 / 1000.0,
+                f.bit_depth
+            )
+        })
+    }
+
+    /// Total added latency in ms (PC capture + USB + phone buffer).
+    fn latency_total_ms(&self) -> Option<u32> {
+        self.latency
+            .map(|(cap, ring, _cap, dev, _u)| cap + 10 + ring as u32 + dev as u32)
+    }
+
+    fn status_pill(&self, ui: &mut egui::Ui) {
+        let (text, color) = match self.conn_state() {
+            ConnState::NoDevice => ("No device", SUBTLE),
+            ConnState::Ready => ("Ready", BLUE),
+            ConnState::Connecting => ("Connecting…", AMBER),
+            ConnState::Streaming => ("Streaming", GREEN),
+            ConnState::Paused => ("Paused", AMBER),
+            ConnState::Error => ("Problem", RED),
+        };
+        ui.label(
+            egui::RichText::new(format!("●  {text}"))
+                .color(color)
+                .strong(),
+        );
+    }
+
+    fn ui_top_bar(&mut self, ui: &mut egui::Ui) {
+        ui.horizontal(|ui| {
+            ui.label(egui::RichText::new("ASLC").size(22.0).strong());
+            ui.add_space(10.0);
+            self.status_pill(ui);
+            ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
+                ui.selectable_value(&mut self.page, Page::Diagnostics, "Diagnostics");
+                ui.selectable_value(&mut self.page, Page::Advanced, "Advanced");
+                ui.selectable_value(&mut self.page, Page::Settings, "Settings");
+                ui.selectable_value(&mut self.page, Page::Home, "Home");
+            });
+        });
+    }
+
+    fn ui_home(&mut self, ui: &mut egui::Ui) {
+        ui.label(egui::RichText::new("Stream this PC's audio to your phone over USB.").size(15.0));
+        ui.add_space(12.0);
+
+        card(ui, "Audio source", |ui| {
+            let mut idx = self.source_idx;
+            egui::ComboBox::from_id_source("home_source")
+                .width(ui.available_width())
+                .selected_text(self.source_label())
+                .show_ui(ui, |ui| {
+                    for i in 0..self.devices.len() {
+                        ui.selectable_value(&mut idx, i, self.devices[i].label.clone());
+                    }
+                });
+            if idx != self.source_idx {
+                self.source_idx = idx;
+                let sel = self.devices.get(idx).and_then(|d| d.selector.clone());
+                if let Some(s) = &self.session {
+                    s.set_source(sel);
+                }
+                self.push_log(format!("Source → {}", self.source_label()));
+            }
+            ui.add_space(2.0);
+            ui.label(
+                egui::RichText::new("What is playing on this PC right now.")
+                    .size(11.5)
+                    .color(SUBTLE),
+            );
+        });
+
+        card(ui, "Receiver", |ui| {
+            if self.receivers.is_empty() {
+                ui.label("No phone found yet.");
+                ui.label(
+                    egui::RichText::new(
+                        "Connect your phone with a USB cable, and on the phone choose \
+                         \u{201c}File transfer\u{201d} when asked.",
+                    )
+                    .size(11.5)
+                    .color(SUBTLE),
+                );
+                ui.add_space(6.0);
+                if ui.button("Look again").clicked() {
+                    self.refresh_receivers();
+                    self.start_probe();
+                }
+            } else {
+                let mut pick: Option<usize> = None;
+                for i in 0..self.receivers.len() {
+                    let selected = i == self.receiver_idx;
+                    let name = self.receiver_name_at(i);
+                    let ready = self.receivers[i].accessory;
+                    ui.horizontal(|ui| {
+                        if ui.selectable_label(selected, name).clicked() && !selected {
+                            pick = Some(i);
+                        }
+                        ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
+                            let (t, c) = if ready {
+                                ("Ready", GREEN)
+                            } else {
+                                ("Available", SUBTLE)
+                            };
+                            ui.label(egui::RichText::new(t).size(11.5).color(c));
+                        });
+                    });
+                }
+                if let Some(i) = pick {
+                    self.receiver_idx = i;
+                    self.start_probe();
+                }
+                ui.add_space(6.0);
+                ui.horizontal(|ui| {
+                    if ui.button("Look again").clicked() {
+                        self.refresh_receivers();
+                        self.start_probe();
+                    }
+                    if let Some(f) = self.format_summary() {
+                        ui.label(
+                            egui::RichText::new(format!("Plays at {f}"))
+                                .size(11.5)
+                                .color(SUBTLE),
+                        );
+                    }
+                });
+            }
+        });
+
+        if self.driver_installed == Some(false) {
+            card(ui, "One-time setup", |ui| {
+                ui.label("This PC needs a small USB access setup before it can reach your phone.");
+                ui.add_space(6.0);
+                ui.horizontal(|ui| {
+                    if ui.button("Set up USB access").clicked() {
+                        self.install_driver();
+                    }
+                    if ui.button("More info").clicked() {
+                        self.page = Page::Advanced;
+                    }
+                });
+            });
+        }
+
+        // Primary action
+        ui.add_space(6.0);
+        let state = self.conn_state();
+        let running = self.session.is_some();
+        let can_start = !self.receivers.is_empty();
+        let (label, color) = match state {
+            ConnState::Streaming | ConnState::Connecting => ("Stop streaming", RED),
+            ConnState::Paused => ("Resume streaming", GREEN),
+            _ => ("Start streaming", GREEN),
+        };
+        let button = egui::Button::new(
+            egui::RichText::new(label)
+                .size(17.0)
+                .color(egui::Color32::WHITE),
+        )
+        .fill(color)
+        .min_size(egui::vec2(ui.available_width(), 46.0));
+        if ui.add_enabled(running || can_start, button).clicked() {
+            match state {
+                ConnState::Streaming | ConnState::Connecting => self.pause(),
+                ConnState::Paused => self.resume(),
+                _ => self.start(),
+            }
+        }
+        if !running && !can_start {
+            ui.add_space(2.0);
+            ui.label(
+                egui::RichText::new("Connect a phone to start streaming.")
+                    .size(11.5)
+                    .color(SUBTLE),
+            );
+        }
+
+        // Status strip
+        ui.add_space(14.0);
+        ui.separator();
+        ui.add_space(8.0);
+        ui.horizontal(|ui| {
+            self.status_pill(ui);
+            ui.label(
+                egui::RichText::new(format!(
+                    "{}  →  {}",
+                    self.source_label(),
+                    self.receiver_label()
+                ))
+                .size(12.5),
+            );
+        });
+        if let Some(e) = &self.error {
+            ui.add_space(2.0);
+            ui.label(egui::RichText::new(e.clone()).size(12.0).color(RED));
+        } else if running {
+            let mut bits = Vec::new();
+            if let Some(f) = self.format_summary() {
+                bits.push(format!("Playing at {f}"));
+            }
+            if let Some(ms) = self.latency_total_ms() {
+                bits.push(format!("≈{ms} ms latency"));
+            }
+            if !bits.is_empty() {
+                ui.add_space(2.0);
+                ui.label(
+                    egui::RichText::new(bits.join("  ·  "))
+                        .size(12.0)
+                        .color(SUBTLE),
+                );
+            }
+        }
+    }
+
+    fn ui_settings(&mut self, ui: &mut egui::Ui) {
+        ui.label(egui::RichText::new("Settings").size(18.0).strong());
+        ui.add_space(10.0);
+
+        let mut do_check = false;
+        let mut do_download: Option<Release> = None;
+        card(ui, "Updates", |ui| {
+            ui.label("Keep ASLC up to date. You'll be asked before anything is installed.");
+            ui.add_space(4.0);
+            match &self.update_state {
+                UpdateState::Idle => {
+                    if ui.button("Check for updates").clicked() {
+                        do_check = true;
+                    }
+                }
+                UpdateState::Checking => {
+                    ui.label("Checking for updates…");
+                }
+                UpdateState::UpToDate => {
+                    ui.label("You're up to date.");
+                    if ui.button("Check again").clicked() {
+                        do_check = true;
+                    }
+                }
+                UpdateState::Downloading => {
+                    ui.label("Downloading the installer…");
+                }
+                UpdateState::Installing => {
+                    ui.label("Launching the installer — ASLC will restart.");
+                }
+                UpdateState::Failed(e) => {
+                    ui.label(egui::RichText::new(format!("Update failed: {e}")).color(RED));
+                    if ui.button("Try again").clicked() {
+                        do_check = true;
+                    }
+                }
+                UpdateState::Available(rel) => {
+                    let kind = if rel.prerelease { "nightly" } else { "release" };
+                    ui.label(format!("Update available: {} ({kind})", rel.tag));
+                    if ui.button("Download & install").clicked() {
+                        do_download = Some(rel.clone());
+                    }
+                }
+            }
+        });
+        if do_check {
+            self.start_update_check();
+        }
+        if let Some(rel) = do_download {
+            self.start_update_download(rel);
+        }
+
+        card(ui, "About", |ui| {
+            ui.label(
+                "ASLC sends the audio playing on this PC to an Android phone over a USB cable.",
+            );
+            ui.add_space(4.0);
+            ui.label(
+                egui::RichText::new(format!(
+                    "Version {}  ·  {}",
+                    update::version(),
+                    update::git_sha()
+                ))
+                .size(11.5)
+                .color(SUBTLE),
+            );
+        });
+    }
+
+    fn ui_advanced(&mut self, ui: &mut egui::Ui) {
+        ui.label(egui::RichText::new("Advanced").size(18.0).strong());
+        ui.add_space(4.0);
+        ui.label(
+            egui::RichText::new(
+                "The defaults suit most setups — change these only if you need to.",
+            )
+            .size(12.0)
+            .color(SUBTLE),
+        );
+        ui.add_space(10.0);
+
+        card(ui, "Audio quality", |ui| {
+            ui.label("Sample rate");
+            let mut rate_idx = self.rate_idx;
+            egui::ComboBox::from_id_source("adv_rate")
+                .width(ui.available_width())
+                .selected_text(self.rate_labels[rate_idx])
+                .show_ui(ui, |ui| {
+                    for i in 0..self.rate_labels.len() {
+                        ui.selectable_value(&mut rate_idx, i, self.rate_labels[i]);
+                    }
+                });
+            if rate_idx != self.rate_idx {
+                self.rate_idx = rate_idx;
+                let v = self.rate_values[rate_idx];
+                let applied = v.or_else(|| self.device_best_format().0);
+                if let Some(s) = &self.session {
+                    s.set_target_rate(applied);
+                }
+                self.push_log(format!("Rate → {}", self.rate_labels[rate_idx]));
+            }
+
+            ui.add_space(6.0);
+            ui.label("Bit depth");
+            let mut depth_idx = self.depth_idx;
+            egui::ComboBox::from_id_source("adv_depth")
+                .width(ui.available_width())
+                .selected_text(self.depth_labels[depth_idx])
+                .show_ui(ui, |ui| {
+                    for i in 0..self.depth_labels.len() {
+                        ui.selectable_value(&mut depth_idx, i, self.depth_labels[i]);
+                    }
+                });
+            if depth_idx != self.depth_idx {
+                self.depth_idx = depth_idx;
+                let v = self.depth_values[depth_idx];
+                let applied = v.or_else(|| self.device_best_format().1);
+                if let Some(s) = &self.session {
+                    s.set_target_depth(applied);
+                }
+                self.push_log(format!("Depth → {}", self.depth_labels[depth_idx]));
+            }
+            ui.add_space(2.0);
+            ui.label(
+                egui::RichText::new(
+                    "\u{201c}Automatic\u{201d} lets the phone use its best setting.",
+                )
+                .size(11.5)
+                .color(SUBTLE),
+            );
+
+            if let (Some(f), Some(ai)) = (self.negotiated, self.device_audio) {
+                if ai.output_sample_rate > 0 && ai.output_sample_rate != f.sample_rate {
+                    ui.add_space(6.0);
+                    ui.label(
+                        egui::RichText::new(
+                            "Note: the phone will resample this stream to match its own output.",
+                        )
+                        .size(11.5)
+                        .color(AMBER),
+                    );
+                }
+            }
+
+            ui.add_space(6.0);
+            ui.label(
+                egui::RichText::new(
+                    "Higher settings use more bandwidth and a larger phone buffer, which adds a \
+                     little latency. The default suits most setups.",
+                )
+                .size(11.5)
+                .color(SUBTLE),
+            );
+        });
+
+        card(ui, "Volume boost", |ui| {
+            ui.label("Adds loudness on top of the PC volume (0% = unchanged).");
+            ui.add_space(4.0);
+            let mut boost = ((self.gain - 1.0).max(0.0) * 100.0).round();
+            if ui
+                .add(
+                    egui::Slider::new(&mut boost, 0.0..=100.0)
+                        .suffix("%")
+                        .fixed_decimals(0),
+                )
+                .changed()
+            {
+                self.gain = 1.0 + boost / 100.0;
+                if let Some(s) = &self.session {
+                    s.set_gain(self.gain);
+                }
+            }
+        });
+
+        card(ui, "USB access (Windows)", |ui| {
+            ui.horizontal(|ui| {
+                ui.label(match self.driver_installed {
+                    Some(true) => "Status: ready",
+                    Some(false) => "Status: setup needed",
+                    None => "Status: checking…",
+                });
+                if ui.button("Check again").clicked() {
+                    self.start_driver_check();
+                }
+            });
+            ui.add_space(4.0);
+            ui.label(
+                egui::RichText::new(
+                    "ASLC uses a small, generic USB driver so it can talk to any Android phone. \
+                     While it is active, Windows file transfer for the phone is paused.",
+                )
+                .size(11.5)
+                .color(SUBTLE),
+            );
+            ui.add_space(6.0);
+            ui.horizontal(|ui| {
+                if ui.button("Set up USB access").clicked() {
+                    self.install_driver();
+                }
+                if ui.button("Restore file transfer").clicked() {
+                    self.restore_mtp();
+                }
+            });
+        });
+    }
+
+    fn ui_diagnostics(&mut self, ui: &mut egui::Ui) {
+        ui.label(egui::RichText::new("Diagnostics").size(18.0).strong());
+        ui.add_space(10.0);
+
+        card(ui, "Connection", |ui| {
+            ui.label(format!("Status: {}", self.status));
+            if let Some(f) = self.negotiated {
+                ui.label(format!("Format: {}", f.display_label()));
+            }
+            if self.kbps > 0.0 {
+                ui.label(format!("Throughput: {:.0} kbit/s", self.kbps));
+            }
+            if let Some((cap, ring, ring_cap, dev, underruns)) = self.latency {
+                let total = self.latency_total_ms().unwrap_or(0);
+                ui.label(format!(
+                    "Latency ≈ {total} ms  (PC {} ms · phone {} + {} ms)",
+                    cap + 10,
+                    ring,
+                    dev
+                ));
+                ui.label(
+                    egui::RichText::new(format!(
+                        "Phone buffer {ring_cap} ms · underruns {underruns}"
+                    ))
+                    .size(11.5)
+                    .color(SUBTLE),
+                );
+            }
+            ui.add_space(2.0);
+            ui.label(
+                egui::RichText::new(match self.driver_installed {
+                    Some(true) => "USB driver: ready",
+                    Some(false) => "USB driver: not installed",
+                    None => "USB driver: checking…",
+                })
+                .size(11.5)
+                .color(SUBTLE),
+            );
+        });
+
+        ui.horizontal(|ui| {
+            ui.label(egui::RichText::new("Log").strong());
+            if ui.button("Clear").clicked() {
+                self.log.clear();
+            }
+        });
+        ui.add_space(4.0);
+        egui::ScrollArea::vertical()
+            .auto_shrink([false, false])
+            .show(ui, |ui| {
+                for line in &self.log {
+                    ui.label(egui::RichText::new(line).size(11.5).monospace());
+                }
+            });
     }
 }
 
@@ -831,354 +1367,26 @@ impl eframe::App for AslcApp {
         }
 
         egui::CentralPanel::default().show(ctx, |ui| {
+            // Centre a comfortable reading column so the app looks right on small and large windows.
+            let full = ui.available_width();
+            let content = full.min(760.0);
+            let pad = ((full - content) * 0.5).max(0.0);
             ui.horizontal(|ui| {
-                ui.heading("ASLC Node");
-                ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
-                    ui.selectable_value(&mut self.tab, Tab::Logs, "Logs");
-                    ui.selectable_value(&mut self.tab, Tab::Settings, "Settings");
-                    ui.selectable_value(&mut self.tab, Tab::Main, "Main");
-                });
-            });
-            ui.separator();
-
-            if self.tab == Tab::Main {
-            ui.label("Stream this PC's audio to the phone over USB (AOA). The PC controls the format.");
-
-            // First-run / missing-driver notice.
-            if self.driver_installed == Some(false) {
-                ui.horizontal_wrapped(|ui| {
-                    ui.colored_label(
-                        egui::Color32::from_rgb(230, 180, 60),
-                        "⚠ The ASLC USB driver isn't installed — USB playback needs it.",
-                    );
-                    if ui.button("Install driver").clicked() {
-                        self.install_driver();
-                    }
-                    if ui.button("Details").clicked() {
-                        self.tab = Tab::Settings;
-                    }
-                });
-            }
-
-            egui::Grid::new("settings")
-                .num_columns(2)
-                .spacing([12.0, 8.0])
-                .show(ui, |ui| {
-                    ui.label("Receiver:");
-                    ui.horizontal(|ui| {
-                        let mut idx = self.receiver_idx;
-                        let label = self
-                            .receivers
-                            .get(idx)
-                            .map(|r| self.receiver_display(r))
-                            .unwrap_or_else(|| "(no receiver found)".into());
-                        egui::ComboBox::from_id_source("receiver")
-                            .width(300.0)
-                            .selected_text(label)
-                            .show_ui(ui, |ui| {
-                                for i in 0..self.receivers.len() {
-                                    let text = self.receiver_display(&self.receivers[i]);
-                                    ui.selectable_value(&mut idx, i, text);
-                                }
-                            });
-                        if idx != self.receiver_idx {
-                            self.receiver_idx = idx;
-                            self.start_probe();
-                        }
-                        if ui.button("Refresh").clicked() {
-                            self.refresh_receivers();
-                            self.start_probe();
-                        }
-                    });
-                    ui.end_row();
-
-                    ui.label("Source:");
-                    ui.horizontal(|ui| {
-                        let mut source_idx = self.source_idx;
-                        let label = self
-                            .devices
-                            .get(source_idx)
-                            .map(|d| d.label.clone())
-                            .unwrap_or_else(|| "(none)".into());
-                        egui::ComboBox::from_id_source("source")
-                            .width(300.0)
-                            .selected_text(label)
-                            .show_ui(ui, |ui| {
-                                for i in 0..self.devices.len() {
-                                    let text = self.devices[i].label.clone();
-                                    ui.selectable_value(&mut source_idx, i, text);
-                                }
-                            });
-                        if source_idx != self.source_idx {
-                            self.source_idx = source_idx;
-                            let sel = self
-                                .devices
-                                .get(source_idx)
-                                .and_then(|d| d.selector.clone());
-                            let lbl = self.devices[source_idx].label.clone();
-                            if let Some(s) = &self.session {
-                                s.set_source(sel);
-                                self.push_log(format!("Source → {lbl}"));
-                            }
-                        }
-                        if ui.button("Refresh").clicked() {
-                            self.refresh_devices();
-                        }
-                    });
-                    ui.end_row();
-
-                    ui.label("Sample rate:");
-                    let mut rate_idx = self.rate_idx;
-                    egui::ComboBox::from_id_source("rate")
-                        .selected_text(self.rate_labels[rate_idx])
-                        .show_ui(ui, |ui| {
-                            for i in 0..self.rate_labels.len() {
-                                ui.selectable_value(&mut rate_idx, i, self.rate_labels[i]);
-                            }
-                        });
-                    if rate_idx != self.rate_idx {
-                        self.rate_idx = rate_idx;
-                        let v = self.rate_values[rate_idx];
-                        let applied = v.or_else(|| self.device_best_format().0);
-                        let label = match (v, applied) {
-                            (None, Some(r)) => {
-                                format!("{} → {} Hz", self.rate_labels[rate_idx], r)
-                            }
-                            _ => self.rate_labels[rate_idx].to_string(),
-                        };
-                        if let Some(s) = &self.session {
-                            s.set_target_rate(applied);
-                        }
-                        self.push_log(format!("Wire rate → {label}"));
-                    }
-                    ui.end_row();
-
-                    ui.label("Bit depth:");
-                    let mut depth_idx = self.depth_idx;
-                    egui::ComboBox::from_id_source("depth")
-                        .selected_text(self.depth_labels[depth_idx])
-                        .show_ui(ui, |ui| {
-                            for i in 0..self.depth_labels.len() {
-                                ui.selectable_value(&mut depth_idx, i, self.depth_labels[i]);
-                            }
-                        });
-                    if depth_idx != self.depth_idx {
-                        self.depth_idx = depth_idx;
-                        let v = self.depth_values[depth_idx];
-                        let applied = v.or_else(|| self.device_best_format().1);
-                        let label = match (v, applied) {
-                            (None, Some(d)) => {
-                                format!("{} → {}-bit", self.depth_labels[depth_idx], d)
-                            }
-                            _ => self.depth_labels[depth_idx].to_string(),
-                        };
-                        if let Some(s) = &self.session {
-                            s.set_target_depth(applied);
-                        }
-                        self.push_log(format!("Wire depth → {label}"));
-                    }
-                    ui.end_row();
-
-                    if let (Some(f), Some(ai)) = (self.negotiated, self.device_audio) {
-                        if ai.output_sample_rate > 0 && ai.output_sample_rate != f.sample_rate {
-                            ui.label("");
-                            ui.colored_label(
-                                egui::Color32::from_rgb(230, 180, 60),
-                                format!(
-                                    "⚠ Phone outputs at {} Hz — a {} Hz stream is resampled by the phone",
-                                    ai.output_sample_rate, f.sample_rate
-                                ),
-                            );
-                            ui.end_row();
-                        }
-                    }
-
-                    ui.label("Volume:");
-                    let mut pct = self.gain * 100.0;
-                    if ui
-                        .add(
-                            egui::Slider::new(&mut pct, 0.0..=200.0)
-                                .suffix("%")
-                                .fixed_decimals(0),
-                        )
-                        .changed()
-                    {
-                        self.gain = pct / 100.0;
-                        if let Some(s) = &self.session {
-                            s.set_gain(self.gain);
-                        }
-                    }
-                    ui.end_row();
-                });
-
-            ui.small(
-                "Latency note: a higher sample rate / bit depth enlarges the phone's jitter buffer, \
-                 which adds latency. 48 kHz · 16-bit is the lowest-latency option; 32-bit 96/192 kHz \
-                 buffers more for smoothness.",
-            );
-
-            ui.separator();
-
-            ui.horizontal(|ui| {
-                let running = self.running();
-                let paused = self.paused;
-                let start_label = if running && paused {
-                    "▶  Resume"
-                } else {
-                    "▶  Start"
-                };
-                if ui
-                    .add_enabled(!running || paused, egui::Button::new(start_label))
-                    .clicked()
-                {
-                    if !running {
-                        self.start();
-                    } else {
-                        self.resume();
-                    }
-                }
-                if ui
-                    .add_enabled(running && !paused, egui::Button::new("■  Stop"))
-                    .clicked()
-                {
-                    self.pause();
-                }
-                if running && !paused {
-                    ui.spinner();
-                }
-                if running && paused {
-                    ui.label("paused");
-                }
-            });
-            } // Tab::Main
-
-            if self.tab == Tab::Settings {
-            ui.separator();
-            ui.heading("USB driver (Windows)");
-            ui.label(
-                "The PC needs a WinUSB-bound interface to talk to the phone. The driver is generic \
-                 (class-based, not per-device): install it once and it covers any Android phone.",
-            );
-            ui.horizontal(|ui| {
-                ui.label(match self.driver_installed {
-                    Some(true) => "Status: installed",
-                    Some(false) => "Status: not installed",
-                    None => "Status: checking…",
-                });
-                if ui.button("Re-check").clicked() {
-                    self.start_driver_check();
-                }
-            });
-            ui.horizontal(|ui| {
-                if ui.button("Install ASLC driver").clicked() {
-                    self.install_driver();
-                }
-                if ui.button("Restore file transfer (MTP)").clicked() {
-                    self.restore_mtp();
-                }
-            });
-            ui.small(
-                "While installed it replaces the phone's MTP driver on this PC (file transfer stops \
-                 working) — 'Restore file transfer (MTP)' undoes it.",
-            );
-            ui.small(
-                "Phone side: set USB to 'File transfer' (MTP) once so the handshake has an interface \
-                 to use; it then switches itself to accessory mode.",
-            );
-
-            ui.separator();
-            ui.heading("Updates");
-            let mut do_check = false;
-            let mut do_download: Option<Release> = None;
-            ui.horizontal(|ui| {
-                ui.label(format!(
-                    "ASLC Node {} · {}",
-                    update::version(),
-                    update::git_sha()
-                ));
-                ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
-                    if ui.button("Check for updates").clicked() {
-                        do_check = true;
+                ui.add_space(pad);
+                ui.vertical(|ui| {
+                    ui.set_width(content);
+                    self.ui_top_bar(ui);
+                    ui.add_space(6.0);
+                    ui.separator();
+                    ui.add_space(8.0);
+                    match self.page {
+                        Page::Home => self.ui_home(ui),
+                        Page::Settings => self.ui_settings(ui),
+                        Page::Advanced => self.ui_advanced(ui),
+                        Page::Diagnostics => self.ui_diagnostics(ui),
                     }
                 });
             });
-            match &self.update_state {
-                UpdateState::Idle => {}
-                UpdateState::Checking => {
-                    ui.label("Checking for updates…");
-                }
-                UpdateState::UpToDate => {
-                    ui.label("Up to date.");
-                }
-                UpdateState::Downloading => {
-                    ui.label("Downloading the installer…");
-                }
-                UpdateState::Installing => {
-                    ui.label("Launching the installer — the app will restart…");
-                }
-                UpdateState::Failed(e) => {
-                    ui.colored_label(
-                        egui::Color32::from_rgb(220, 130, 90),
-                        format!("Update failed: {e}"),
-                    );
-                }
-                UpdateState::Available(rel) => {
-                    let kind = if rel.prerelease { "nightly" } else { "release" };
-                    ui.horizontal(|ui| {
-                        ui.colored_label(
-                            egui::Color32::from_rgb(90, 170, 230),
-                            format!("Update available: {} ({kind})", rel.tag),
-                        );
-                        if ui.button("Download & install").clicked() {
-                            do_download = Some(rel.clone());
-                        }
-                    });
-                }
-            }
-            if do_check {
-                self.start_update_check();
-            }
-            if let Some(rel) = do_download {
-                self.start_update_download(rel);
-            }
-            } // Tab::Settings
-
-            if self.tab == Tab::Main {
-            ui.separator();
-            ui.label(format!("Status: {}", self.status));
-            if let Some(f) = self.negotiated {
-                ui.label(format!("Format: {}", f.display_label()));
-            }
-            if self.kbps > 0.0 {
-                ui.label(format!("Throughput: {:.0} kbit/s", self.kbps));
-            }
-            if let Some((cap, ring, ring_cap, dev, underruns)) = self.latency {
-                let total = cap + 10 + ring as u32 + dev as u32;
-                ui.label(format!(
-                    "Latency ≈ {total} ms   (PC {} ms · phone {} + {} ms)",
-                    cap + 10,
-                    ring,
-                    dev
-                ));
-                ui.small(format!("phone buffer {ring_cap} ms · underruns {underruns}"));
-            }
-            } // Tab::Main
-
-            if self.tab == Tab::Logs {
-            ui.horizontal(|ui| {
-                ui.label("Log:");
-                if ui.button("Clear").clicked() {
-                    self.log.clear();
-                }
-            });
-            egui::ScrollArea::vertical()
-                .auto_shrink([false, false])
-                .show(ui, |ui| {
-                    for line in &self.log {
-                        ui.small(line);
-                    }
-                });
-            }
         });
 
         // Keep repainting while visible so session stats update; when hidden this stops (the tray
@@ -1187,10 +1395,39 @@ impl eframe::App for AslcApp {
             || self.update_rx.is_some()
             || self.probe_rx.is_some()
             || self.driver_rx.is_some()
-            || self.tab == Tab::Logs;
+            || self.page == Page::Diagnostics;
         // Always wake periodically so the receiver list stays current and the window stays live.
         ctx.request_repaint_after(Duration::from_millis(if busy { 150 } else { 2000 }));
     }
+}
+
+/// Shared accent colours. The words carry the meaning too, so colour is never the only signal.
+const GREEN: egui::Color32 = egui::Color32::from_rgb(46, 196, 107);
+const AMBER: egui::Color32 = egui::Color32::from_rgb(232, 184, 74);
+const RED: egui::Color32 = egui::Color32::from_rgb(224, 96, 86);
+const BLUE: egui::Color32 = egui::Color32::from_rgb(96, 156, 232);
+const SUBTLE: egui::Color32 = egui::Color32::from_rgb(150, 156, 166);
+
+/// A clean, spacious theme so the app reads as a product, not a developer tool.
+fn apply_theme(ctx: &egui::Context) {
+    let mut style = (*ctx.style()).clone();
+    style.spacing.item_spacing = egui::vec2(12.0, 10.0);
+    style.spacing.button_padding = egui::vec2(16.0, 9.0);
+    style.spacing.interact_size.y = 30.0;
+    style.visuals.panel_fill = egui::Color32::from_rgb(22, 24, 28);
+    style.visuals.window_fill = egui::Color32::from_rgb(26, 28, 33);
+    style.visuals.widgets.noninteractive.bg_fill = egui::Color32::from_rgb(32, 35, 41);
+    ctx.set_style(style);
+}
+
+/// A titled card: a framed group with a heading and comfortable spacing.
+fn card<R>(ui: &mut egui::Ui, title: &str, body: impl FnOnce(&mut egui::Ui) -> R) {
+    ui.group(|ui| {
+        ui.label(egui::RichText::new(title).strong());
+        ui.add_space(6.0);
+        body(ui);
+    });
+    ui.add_space(8.0);
 }
 
 /// True when a driver package whose original name is `aslc_aoa.inf` is present in the driver store.

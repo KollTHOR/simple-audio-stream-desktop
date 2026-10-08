@@ -21,6 +21,9 @@ pub const MSG_PCM_DATA: u8 = 0x06;
 pub const MSG_STOP: u8 = 0x07;
 pub const MSG_ERROR: u8 = 0x08;
 pub const MSG_TELEMETRY: u8 = 0x09;
+/// Device -> host: the device's audio-output characteristics (native output rate/buffer), used by
+/// the host to warn when the negotiated stream rate will be resampled by the phone.
+pub const MSG_AUDIO_INFO: u8 = 0x0A;
 
 // Error codes (MSG_ERROR payload).
 pub const ERR_VERSION_UNSUPPORTED: u16 = 1;
@@ -43,6 +46,8 @@ pub fn describe_message_type(t: u8) -> String {
         MSG_PCM_DATA => "PCM_DATA".into(),
         MSG_STOP => "STOP".into(),
         MSG_ERROR => "ERROR".into(),
+        MSG_TELEMETRY => "TELEMETRY".into(),
+        MSG_AUDIO_INFO => "AUDIO_INFO".into(),
         other => format!("UNKNOWN(0x{:02x})", other),
     }
 }
@@ -181,7 +186,7 @@ pub fn decode_header(buf: &[u8]) -> Result<AslcHeader, AslcError> {
     let sequence = read_u32_be(buf, 4);
     let payload_length = read_u32_be(buf, 8);
 
-    if !(MSG_HELLO..=MSG_ERROR).contains(&message_type) {
+    if !(MSG_HELLO..=MSG_AUDIO_INFO).contains(&message_type) {
         return Err(AslcError::MalformedHeader);
     }
     if payload_length > MAX_PAYLOAD {
@@ -338,6 +343,18 @@ mod tests {
         let mut b = [0u8; HEADER_SIZE];
         b[1] = 0x7F;
         assert!(matches!(decode_header(&b), Err(AslcError::MalformedHeader)));
+    }
+
+    #[test]
+    fn extended_inbound_types_accepted() {
+        // Regression: the host receives TELEMETRY (0x09) and AUDIO_INFO (0x0A) from the device,
+        // so the header range check must admit them.
+        for t in [MSG_TELEMETRY, MSG_AUDIO_INFO] {
+            let mut b = [0u8; HEADER_SIZE];
+            b[0] = PROTOCOL_VERSION;
+            b[1] = t;
+            assert!(decode_header(&b).is_ok(), "type 0x{t:02x} was rejected");
+        }
     }
 
     #[test]

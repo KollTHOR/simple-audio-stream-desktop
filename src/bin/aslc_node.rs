@@ -594,6 +594,14 @@ fn run_session_cmd(args: Vec<String>) {
             match ev {
                 aslc::SessionEvent::State(s) => println!("[state] {s}"),
                 aslc::SessionEvent::Negotiated(f) => println!("[format] {}", f.display_label()),
+                aslc::SessionEvent::Capabilities(caps) => println!(
+                    "[caps] rates {:?} · depths {:?} · channels {:?}",
+                    caps.sample_rates, caps.bit_depths, caps.channels
+                ),
+                aslc::SessionEvent::DeviceAudio(ai) => println!(
+                    "[audio] phone output: {} Hz · {} frames/buffer",
+                    ai.output_sample_rate, ai.output_frames_per_buffer
+                ),
                 aslc::SessionEvent::Paused(p) => println!("[paused] {p}"),
                 aslc::SessionEvent::Stats { kbps } => println!("[stats] {kbps:.0} kbit/s"),
                 aslc::SessionEvent::Latency {

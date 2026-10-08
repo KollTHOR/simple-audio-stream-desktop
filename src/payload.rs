@@ -289,6 +289,39 @@ pub fn parse_telemetry(payload: &[u8]) -> Option<Telemetry> {
     })
 }
 
+// ---- AUDIO_INFO --------------------------------------------------------------------------
+
+/// The device's audio-output characteristics, sent once per connection (device -> host). Lets the
+/// host warn when the negotiated stream rate will be resampled by the phone's output path.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub struct AudioInfo {
+    /// The device's declared native output sample rate (Hz); 0 when unknown.
+    pub output_sample_rate: u32,
+    /// The device's declared output buffer size in frames; 0 when unknown.
+    pub output_frames_per_buffer: u32,
+    /// Reserved bit flags (0 today).
+    pub flags: u32,
+}
+
+pub fn audio_info_payload(info: &AudioInfo) -> Vec<u8> {
+    let mut buf = vec![0u8; 12];
+    write_u32_be(&mut buf, 0, info.output_sample_rate);
+    write_u32_be(&mut buf, 4, info.output_frames_per_buffer);
+    write_u32_be(&mut buf, 8, info.flags);
+    buf
+}
+
+pub fn parse_audio_info(payload: &[u8]) -> Option<AudioInfo> {
+    if payload.len() < 12 {
+        return None;
+    }
+    Some(AudioInfo {
+        output_sample_rate: read_u32_be(payload, 0),
+        output_frames_per_buffer: read_u32_be(payload, 4),
+        flags: read_u32_be(payload, 8),
+    })
+}
+
 // ---- PCM_DATA ----------------------------------------------------------------------------
 
 /// Serializes a complete PCM_DATA frame: `u32 frameCount` + `frames * bytes_per_frame` raw bytes.
@@ -380,5 +413,18 @@ mod tests {
         // frame = 12 header + 4 count + pcm
         assert_eq!(frame.len(), crate::frame::HEADER_SIZE + 4 + pcm.len());
         assert_eq!(pcm_frame_count(&frame[crate::frame::HEADER_SIZE..]), 5);
+    }
+
+    #[test]
+    fn audio_info_roundtrip() {
+        let info = AudioInfo {
+            output_sample_rate: 192_000,
+            output_frames_per_buffer: 192,
+            flags: 0,
+        };
+        let p = audio_info_payload(&info);
+        assert_eq!(p.len(), 12);
+        assert_eq!(parse_audio_info(&p), Some(info));
+        assert!(parse_audio_info(&p[..11]).is_none());
     }
 }

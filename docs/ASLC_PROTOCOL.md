@@ -45,6 +45,7 @@ consumes `12 + payload_length` bytes can never desync.
 | 0x07  | STOP            | host → device | end stream |
 | 0x08  | ERROR           | either        | protocol error |
 | 0x09  | TELEMETRY       | device → host | periodic buffer/latency figures |
+| 0x0A  | AUDIO_INFO      | device → host | device output rate/buffer (resample hint) |
 
 **Initiator:** the Android *device* speaks first. On attach it sends `HELLO` + `CAPABILITIES`
 unprompted; the desktop *host* does **not** need to send `HELLO` first. The host replies with
@@ -112,6 +113,15 @@ Sent periodically (~2 Hz) while `STREAMING`; lets the host display real latency 
 device reports what it can measure locally (its input ring buffer + its AudioTrack buffering); the
 host adds its own capture/transport terms.
 `u16 ring_fill_ms, u16 ring_capacity_ms, u16 device_latency_ms, u16 reserved(=0), u32 underruns`
+
+### AUDIO_INFO (device → host)
+`u32 output_sample_rate, u32 output_frames_per_buffer, u32 flags(=0)` (12 bytes)
+Sent once per connection, right after `CAPABILITIES`. `output_sample_rate` is the device's declared
+native output rate (`AudioManager.PROPERTY_OUTPUT_SAMPLE_RATE`, `0` = unknown); the host MAY flag
+when the negotiated stream rate differs, since the phone's output path may then resample.
+**Best-effort**: some ROMs report a policy value that differs from the actual mixer rate.
+
+Message types above `AUDIO_INFO` (0x0A) are unknown and treated as malformed headers.
 
 ## PCM sample format
 

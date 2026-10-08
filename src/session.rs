@@ -18,10 +18,11 @@ use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
 
 use crate::aoa::AoaTransport;
+use crate::capabilities::PcmCapabilities;
 use crate::frame::{
     FrameWriter, MSG_CONFIGURE, MSG_HELLO, MSG_PCM_DATA, MSG_START, MSG_STOP, PROTOCOL_VERSION,
 };
-use crate::payload::{configure_payload, hello_payload, PCM_FRAME_COUNT_SIZE};
+use crate::payload::{configure_payload, hello_payload, AudioInfo, PCM_FRAME_COUNT_SIZE};
 use crate::receiver::{Inbound, InboundReader, Negotiation, Receiver};
 use crate::transport::{Halves, Transport};
 use crate::PcmFormat;
@@ -76,6 +77,11 @@ pub enum SessionEvent {
     State(String),
     /// Negotiation completed for this wire format.
     Negotiated(PcmFormat),
+    /// The device's advertised PCM capability set (from its `CAPABILITIES` message). The GUI uses
+    /// this to restrict the rate/bit-depth choices to what the phone actually offers.
+    Capabilities(PcmCapabilities),
+    /// The device's audio-output characteristics (native output rate/buffer), from `AUDIO_INFO`.
+    DeviceAudio(AudioInfo),
     /// Streaming paused (true) or resumed (false).
     Paused(bool),
     /// Rolling throughput (kbit/s).
@@ -203,6 +209,80 @@ fn open_pipe(sel: &PhoneSelector) -> Result<(AoaTransport, Halves), String> {
     }
 }
 
+/// The result of a read-only capability probe: what the phone offers plus its audio-output
+/// characteristics. No CONFIGURE/START, so the phone stays idle.
+#[derive(Debug, Clone)]
+pub struct ProbeResult {
+    pub capabilities: PcmCapabilities,
+    pub audio_info: Option<AudioInfo>,
+}
+
+/// Read-only probe: open the AOA pipe, greet the phone, and collect its `CAPABILITIES` (and a
+/// trailing `AUDIO_INFO`) without configuring or starting a stream. Lets the GUI constrain its
+/// rate/depth menus before the first Start.
+pub fn probe_capabilities(cfg: &SessionConfig) -> Result<ProbeResult, String> {
+    let (mut transport, (reader, writer)) = open_pipe(&cfg.phone)?;
+
+    let (itx, irx) = channel::<Result<Inbound, String>>();
+    std::thread::Builder::new()
+        .name("aslc-probe".into())
+        .spawn(move || {
+            let mut r = InboundReader::new(reader);
+            loop {
+                match r.next_inbound() {
+                    Ok(Some(m)) => {
+                        if itx.send(Ok(m)).is_err() {
+                            return;
+                        }
+                    }
+                    Ok(None) => return,
+                    Err(_) => return,
+                }
+            }
+        })
+        .ok();
+
+    let mut outbound = FrameWriter::new(writer);
+    let hello = hello_payload(PROTOCOL_VERSION, false, "ASLC Node");
+    if let Err(e) = outbound.write_frame(MSG_HELLO, &hello, 0, hello.len(), 0) {
+        transport.close();
+        return Err(format!("USB write failed (HELLO): {e}"));
+    }
+
+    let deadline = Instant::now() + Duration::from_secs(cfg.wait_secs.max(1));
+    let mut caps: Option<PcmCapabilities> = None;
+    let mut audio_info: Option<AudioInfo> = None;
+    let mut caps_at: Option<Instant> = None;
+    loop {
+        if Instant::now() >= deadline {
+            break;
+        }
+        // Once the caps are in, wait briefly for a trailing AUDIO_INFO, then finish.
+        if caps_at.is_some_and(|t| t.elapsed() > Duration::from_millis(400)) {
+            break;
+        }
+        match irx.recv_timeout(Duration::from_millis(100)) {
+            Ok(Ok(Inbound::Capabilities(c))) => {
+                caps = Some(c);
+                caps_at = Some(Instant::now());
+            }
+            Ok(Ok(Inbound::AudioInfo(ai))) => audio_info = Some(ai),
+            Ok(Ok(_)) => {}
+            Ok(Err(_)) => break,
+            Err(RecvTimeoutError::Timeout) => {}
+            Err(RecvTimeoutError::Disconnected) => break,
+        }
+    }
+    transport.close();
+    match caps {
+        Some(capabilities) => Ok(ProbeResult {
+            capabilities,
+            audio_info,
+        }),
+        None => Err("no capabilities from the phone — open the app and enable USB Receive".into()),
+    }
+}
+
 #[cfg(windows)]
 fn open_source(sel: &Option<String>) -> Result<Option<LoopbackSource>, String> {
     LoopbackSource::open(sel.as_deref()).map(Some)
@@ -306,6 +386,7 @@ fn negotiate(
     wait_secs: u64,
     want_rate: Option<u32>,
     want_depth: Option<u8>,
+    emit: &dyn Fn(SessionEvent),
 ) -> Result<PcmFormat, String> {
     *recv = Receiver::new();
     recv.set_preferred_sample_rate(want_rate);
@@ -327,9 +408,13 @@ fn negotiate(
         }
         match irx.recv_timeout(Duration::from_millis(150)) {
             Ok(Ok(m)) => {
+                if let Inbound::AudioInfo(ai) = &m {
+                    emit(SessionEvent::DeviceAudio(*ai));
+                }
                 if let Some(step) = recv.handle(&m) {
                     match step {
-                        Negotiation::Ready(_caps, fmt) => {
+                        Negotiation::Ready(caps, fmt) => {
+                            emit(SessionEvent::Capabilities(caps));
                             let payload = configure_payload(fmt);
                             outbound
                                 .write_frame(MSG_CONFIGURE, &payload, 0, payload.len(), *seq)
@@ -459,7 +544,7 @@ fn run_session(
                 emit(SessionEvent::State(msg));
             }
             let (wr, wd) = resolve_want(&target_rate, &target_depth, loopback.as_ref());
-            match negotiate(&mut outbound, &mut recv, &irx, &mut seq, &stop, cfg.wait_secs, wr, wd) {
+            match negotiate(&mut outbound, &mut recv, &irx, &mut seq, &stop, cfg.wait_secs, wr, wd, &emit) {
                 Ok(f) => {
                     fmt = f;
                     frames_per_msg = (fmt.sample_rate / 100).max(1);
@@ -510,6 +595,7 @@ fn run_session(
                 Ok(Inbound::Hello(_))
                 | Ok(Inbound::Capabilities(_))
                 | Ok(Inbound::Error(_)) => restarted = true,
+                Ok(Inbound::AudioInfo(ai)) => emit(SessionEvent::DeviceAudio(ai)),
                 Ok(Inbound::ConfigureAck(_)) => {}
                 Err(_) => reader_dead = true,
             }

@@ -25,8 +25,11 @@ use tray_icon::{
 };
 
 use aslc::aoa::ReceiverDevice;
-use aslc::session::{PhoneSelector, SessionConfig, SessionEvent, SessionHandle};
-use aslc::PcmFormat;
+use aslc::payload::AudioInfo;
+use aslc::session::{
+    probe_capabilities, PhoneSelector, ProbeResult, SessionConfig, SessionEvent, SessionHandle,
+};
+use aslc::{capabilities::PcmCapabilities, PcmFormat};
 
 fn main() -> eframe::Result<()> {
     let options = eframe::NativeOptions {
@@ -50,6 +53,25 @@ struct DeviceItem {
     selector: Option<String>,
 }
 
+/// The full wire-rate menu; entries above what the phone advertises are filtered out at runtime.
+const RATE_CHOICES: [(&str, Option<u32>); 7] = [
+    ("Native (follow source)", None),
+    ("44.1 kHz", Some(44_100)),
+    ("48 kHz", Some(48_000)),
+    ("88.2 kHz", Some(88_200)),
+    ("96 kHz", Some(96_000)),
+    ("176.4 kHz", Some(176_400)),
+    ("192 kHz", Some(192_000)),
+];
+
+/// The full bit-depth menu; filtered like `RATE_CHOICES`.
+const DEPTH_CHOICES: [(&str, Option<u8>); 4] = [
+    ("Native", None),
+    ("16-bit", Some(16)),
+    ("24-bit", Some(24)),
+    ("32-bit", Some(32)),
+];
+
 struct AslcApp {
     receivers: Vec<ReceiverDevice>,
     receiver_idx: usize,
@@ -64,6 +86,14 @@ struct AslcApp {
     depth_labels: Vec<&'static str>,
     depth_values: Vec<Option<u8>>,
     depth_idx: usize,
+
+    /// The phone's advertised PCM capability set (from its CAPABILITIES message); `None` until the
+    /// first negotiation completes. Used to restrict the rate/depth menus to what it offers.
+    caps: Option<PcmCapabilities>,
+    /// The phone's audio-output characteristics (native output rate), from its `AUDIO_INFO` message.
+    device_audio: Option<AudioInfo>,
+    /// In-flight pre-start capability probe result, if any.
+    probe_rx: Option<std::sync::mpsc::Receiver<Result<ProbeResult, String>>>,
 
     gain: f32,
 
@@ -92,28 +122,15 @@ impl AslcApp {
             receiver_idx: 0,
             devices: Vec::new(),
             source_idx: 0,
-            rate_labels: vec![
-                "Native (follow source)",
-                "44.1 kHz",
-                "48 kHz",
-                "88.2 kHz",
-                "96 kHz",
-                "176.4 kHz",
-                "192 kHz",
-            ],
-            rate_values: vec![
-                None,
-                Some(44_100),
-                Some(48_000),
-                Some(88_200),
-                Some(96_000),
-                Some(176_400),
-                Some(192_000),
-            ],
+            rate_labels: RATE_CHOICES.iter().map(|c| c.0).collect(),
+            rate_values: RATE_CHOICES.iter().map(|c| c.1).collect(),
             rate_idx: 0,
-            depth_labels: vec!["Native", "16-bit", "24-bit", "32-bit"],
-            depth_values: vec![None, Some(16), Some(24), Some(32)],
+            depth_labels: DEPTH_CHOICES.iter().map(|c| c.0).collect(),
+            depth_values: DEPTH_CHOICES.iter().map(|c| c.1).collect(),
             depth_idx: 0,
+            caps: None,
+            device_audio: None,
+            probe_rx: None,
             gain: 1.0,
             session: None,
             terminal: false,
@@ -131,6 +148,9 @@ impl AslcApp {
         };
         app.refresh_devices();
         app.refresh_receivers();
+        if !app.receivers.is_empty() {
+            app.start_probe();
+        }
         app._tray = app.build_tray();
         spawn_tray_thread(
             cc.egui_ctx.clone(),
@@ -240,6 +260,24 @@ impl AslcApp {
                     self.negotiated = Some(f);
                     self.push_log(format!("Negotiated {}", f.display_label()));
                 }
+                SessionEvent::Capabilities(caps) => {
+                    self.push_log(format!(
+                        "Phone offers {} rate(s), {} depth(s)",
+                        caps.sample_rates.len(),
+                        caps.bit_depths.len()
+                    ));
+                    self.caps = Some(caps);
+                    self.apply_caps();
+                }
+                SessionEvent::DeviceAudio(ai) => {
+                    if ai.output_sample_rate > 0 {
+                        self.push_log(format!(
+                            "Phone output: {} Hz · {} frames/buffer",
+                            ai.output_sample_rate, ai.output_frames_per_buffer
+                        ));
+                    }
+                    self.device_audio = Some(ai);
+                }
                 SessionEvent::Stats { kbps } => self.kbps = kbps,
                 SessionEvent::Latency {
                     capture_ms,
@@ -272,6 +310,97 @@ impl AslcApp {
             self.kbps = 0.0;
             self.paused = false;
             self.latency = None;
+        }
+    }
+
+    /// Restrict the rate/depth menus to what the connected phone actually advertises (keeping the
+    /// "Native" entries). If the current selection is no longer offered, fall back to "Native".
+    fn apply_caps(&mut self) {
+        let Some(caps) = self.caps.clone() else {
+            return;
+        };
+        let cur_rate = self.rate_values.get(self.rate_idx).copied().flatten();
+        let cur_depth = self.depth_values.get(self.depth_idx).copied().flatten();
+
+        let rate_ok = |v: &Option<u32>| v.is_none() || v.is_some_and(|r| caps.sample_rates.contains(&r));
+        self.rate_labels = RATE_CHOICES.iter().filter(|c| rate_ok(&c.1)).map(|c| c.0).collect();
+        self.rate_values = RATE_CHOICES.iter().filter(|c| rate_ok(&c.1)).map(|c| c.1).collect();
+        self.rate_idx = self.rate_values.iter().position(|v| *v == cur_rate).unwrap_or(0);
+
+        let depth_ok =
+            |v: &Option<u8>| v.is_none() || v.is_some_and(|d| caps.bit_depths.contains(&d));
+        self.depth_labels =
+            DEPTH_CHOICES.iter().filter(|c| depth_ok(&c.1)).map(|c| c.0).collect();
+        self.depth_values =
+            DEPTH_CHOICES.iter().filter(|c| depth_ok(&c.1)).map(|c| c.1).collect();
+        self.depth_idx = self.depth_values.iter().position(|v| *v == cur_depth).unwrap_or(0);
+
+        if self.rate_values.is_empty() {
+            self.rate_labels = vec!["Native (follow source)"];
+            self.rate_values = vec![None];
+            self.rate_idx = 0;
+        }
+        if self.depth_values.is_empty() {
+            self.depth_labels = vec!["Native"];
+            self.depth_values = vec![None];
+            self.depth_idx = 0;
+        }
+    }
+
+    /// Kick off a read-only capability probe on the selected receiver (background thread). Safe to
+    /// call repeatedly; the previous probe result (if any) is superseded.
+    fn start_probe(&mut self) {
+        if self.running() {
+            return;
+        }
+        let cfg = SessionConfig {
+            phone: self.selected_selector(),
+            device: None,
+            target_rate: None,
+            target_depth: None,
+            gain: 1.0,
+            tone: false,
+            wait_secs: 8,
+        };
+        let (tx, rx) = std::sync::mpsc::channel();
+        std::thread::spawn(move || {
+            let _ = tx.send(probe_capabilities(&cfg));
+        });
+        self.probe_rx = Some(rx);
+        self.push_log("Probing device capabilities…".into());
+    }
+
+    /// Drain a finished probe, if any: store the caps + audio output info and constrain the menus.
+    fn poll_probe(&mut self) {
+        let Some(rx) = &self.probe_rx else {
+            return;
+        };
+        match rx.try_recv() {
+            Ok(Ok(res)) => {
+                self.push_log(format!(
+                    "Device offers {} rate(s), {} depth(s)",
+                    res.capabilities.sample_rates.len(),
+                    res.capabilities.bit_depths.len()
+                ));
+                if let Some(ai) = res.audio_info {
+                    if ai.output_sample_rate > 0 {
+                        self.push_log(format!(
+                            "Phone output: {} Hz · {} frames/buffer",
+                            ai.output_sample_rate, ai.output_frames_per_buffer
+                        ));
+                    }
+                    self.device_audio = Some(ai);
+                }
+                self.caps = Some(res.capabilities);
+                self.apply_caps();
+                self.probe_rx = None;
+            }
+            Ok(Err(e)) => {
+                self.push_log(format!("Probe: {e}"));
+                self.probe_rx = None;
+            }
+            Err(std::sync::mpsc::TryRecvError::Empty) => {}
+            Err(std::sync::mpsc::TryRecvError::Disconnected) => self.probe_rx = None,
         }
     }
 
@@ -385,6 +514,7 @@ impl eframe::App for AslcApp {
         }
 
         self.poll();
+        self.poll_probe();
 
         // Close → minimize (stays running in the taskbar); tray restores it.
         if ctx.input(|i| i.viewport().close_requested()) {
@@ -421,9 +551,11 @@ impl eframe::App for AslcApp {
                             });
                         if idx != self.receiver_idx {
                             self.receiver_idx = idx;
+                            self.start_probe();
                         }
                         if ui.button("Refresh").clicked() {
                             self.refresh_receivers();
+                            self.start_probe();
                         }
                     });
                     ui.end_row();
@@ -500,6 +632,20 @@ impl eframe::App for AslcApp {
                         }
                     }
                     ui.end_row();
+
+                    if let (Some(f), Some(ai)) = (self.negotiated, self.device_audio) {
+                        if ai.output_sample_rate > 0 && ai.output_sample_rate != f.sample_rate {
+                            ui.label("");
+                            ui.colored_label(
+                                egui::Color32::from_rgb(230, 180, 60),
+                                format!(
+                                    "⚠ Phone outputs at {} Hz — a {} Hz stream is resampled by the phone",
+                                    ai.output_sample_rate, f.sample_rate
+                                ),
+                            );
+                            ui.end_row();
+                        }
+                    }
 
                     ui.label("Volume:");
                     let mut pct = self.gain * 100.0;

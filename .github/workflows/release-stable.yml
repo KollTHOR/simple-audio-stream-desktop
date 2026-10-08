@@ -54,6 +54,7 @@ jobs:
         shell: bash
         env:
           SOURCE_DATE_EPOCH: ${{ steps.version_meta.outputs.commit_epoch }}
+          ASLC_RELEASE_TAG: ${{ steps.version_meta.outputs.tag_name }}
         run: cargo build --release
 
       - name: Install Inno Setup

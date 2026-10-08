@@ -30,4 +30,10 @@ fn main() {
         .filter(|s| !s.is_empty())
         .unwrap_or_else(|| "unknown".to_string());
     println!("cargo:rustc-env=ASLC_GIT_SHA={sha}");
+
+    // The release tag this binary is being built for (CI sets it). Empty for local/dev builds; the
+    // updater uses it to avoid offering the very release the running binary came from.
+    println!("cargo:rerun-if-env-changed=ASLC_RELEASE_TAG");
+    let tag = std::env::var("ASLC_RELEASE_TAG").unwrap_or_default();
+    println!("cargo:rustc-env=ASLC_RELEASE_TAG={tag}");
 }

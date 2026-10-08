@@ -31,6 +31,11 @@ pub fn version() -> &'static str {
     env!("CARGO_PKG_VERSION")
 }
 
+/// The release tag this binary was built for (empty for local/dev builds).
+pub fn release_tag() -> &'static str {
+    env!("ASLC_RELEASE_TAG")
+}
+
 /// One published release that carries a usable installer.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct Release {
@@ -48,13 +53,21 @@ pub struct Release {
 }
 
 impl Release {
-    /// True when this release was published meaningfully after this build (a 60 s slack absorbs
-    /// clock skew between the runner and the local build).
+    /// True when this release was published meaningfully after this build. A release whose tag is
+    /// the very tag this binary was built from is never "newer" (a nightly is published moments
+    /// after its commit, so the timestamp alone would otherwise offer the binary its own release).
     pub fn is_newer_than_this_build(&self) -> bool {
-        self.published_at
-            .map(|t| t > build_epoch() + 60)
-            .unwrap_or(false)
+        release_is_newer(&self.tag, self.published_at, release_tag(), build_epoch())
     }
+}
+
+/// Pure: is `rel_tag` a newer release than a binary stamped `own_tag`/`own_epoch`?
+fn release_is_newer(rel_tag: &str, published: Option<u64>, own_tag: &str, own_epoch: u64) -> bool {
+    if !own_tag.is_empty() && rel_tag == own_tag {
+        return false;
+    }
+    // A 60 s slack absorbs clock skew between the runner and the local build.
+    published.map(|t| t > own_epoch + 60).unwrap_or(false)
 }
 
 fn curl_base() -> Command {
@@ -275,20 +288,15 @@ mod tests {
     }
 
     #[test]
-    fn newer_requires_grace_over_build() {
-        let mk = |published: Option<u64>| Release {
-            tag: "nightly".into(),
-            display_version: "0.1.0".into(),
-            prerelease: true,
-            published_at: published,
-            notes: String::new(),
-            asset_name: "ASLC-Node-Setup-0.1.0.exe".into(),
-            asset_url: "https://example.test/a.exe".into(),
-            sha_url: None,
-        };
-        assert!(!mk(None).is_newer_than_this_build());
-        assert!(!mk(Some(build_epoch())).is_newer_than_this_build());
-        assert!(mk(Some(build_epoch() + 3600)).is_newer_than_this_build());
+    fn newer_uses_time_and_never_the_own_tag() {
+        let epoch = 1_000_000;
+        assert!(!release_is_newer("nightly-x", None, "", epoch));
+        assert!(!release_is_newer("nightly-x", Some(epoch), "", epoch));
+        assert!(release_is_newer("nightly-x", Some(epoch + 3600), "", epoch));
+        // The exact tag we were built from is never "newer", even though it was published later.
+        assert!(!release_is_newer("nightly-x", Some(epoch + 3600), "nightly-x", epoch));
+        // A different tag published later IS newer.
+        assert!(release_is_newer("nightly-y", Some(epoch + 3600), "nightly-x", epoch));
     }
 
     #[test]
@@ -333,5 +341,17 @@ mod tests {
         let json = r#"[{"tag_name":"x","assets":[{"name":"a.txt","browser_download_url":"u"}]}]"#;
         assert!(parse_releases(json).unwrap().is_none());
         assert!(parse_releases("not json").is_err());
+    }
+
+    /// Manual check against the live GitHub API (network). Run with:
+    /// `cargo test --lib -- --ignored live_fetch_latest --nocapture`
+    #[test]
+    #[ignore = "hits the live GitHub API"]
+    fn live_fetch_latest() {
+        let rel = fetch_latest().expect("fetch_latest");
+        println!("tag={} prerelease={} published={:?}", rel.tag, rel.prerelease, rel.published_at);
+        println!("asset={} url={}", rel.asset_name, rel.asset_url);
+        println!("sha_url={:?}", rel.sha_url);
+        println!("this build epoch={} newer_than_this_build={}", build_epoch(), rel.is_newer_than_this_build());
     }
 }

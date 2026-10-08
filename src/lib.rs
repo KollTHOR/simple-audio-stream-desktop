@@ -12,11 +12,11 @@
 //! - [`transport`] — an ordered byte pipe abstraction (TCP now, AOA later).
 
 pub mod aoa;
+#[cfg(windows)]
+pub mod audio;
 pub mod capabilities;
 pub mod format;
 pub mod frame;
-#[cfg(windows)]
-pub mod audio;
 pub mod payload;
 pub mod receiver;
 pub mod session;

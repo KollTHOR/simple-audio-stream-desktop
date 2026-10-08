@@ -164,12 +164,19 @@ fn parse_releases(json_text: &str) -> Result<Option<Release>, String> {
         let rel = Release {
             tag: tag.to_string(),
             display_version: tag.trim_start_matches('v').to_string(),
-            prerelease: r.get("prerelease").and_then(|v| v.as_bool()).unwrap_or(false),
+            prerelease: r
+                .get("prerelease")
+                .and_then(|v| v.as_bool())
+                .unwrap_or(false),
             published_at: r
                 .get("published_at")
                 .and_then(|v| v.as_str())
                 .and_then(parse_iso8601),
-            notes: r.get("body").and_then(|v| v.as_str()).unwrap_or("").to_string(),
+            notes: r
+                .get("body")
+                .and_then(|v| v.as_str())
+                .unwrap_or("")
+                .to_string(),
             asset_name,
             asset_url,
             sha_url,
@@ -294,9 +301,19 @@ mod tests {
         assert!(!release_is_newer("nightly-x", Some(epoch), "", epoch));
         assert!(release_is_newer("nightly-x", Some(epoch + 3600), "", epoch));
         // The exact tag we were built from is never "newer", even though it was published later.
-        assert!(!release_is_newer("nightly-x", Some(epoch + 3600), "nightly-x", epoch));
+        assert!(!release_is_newer(
+            "nightly-x",
+            Some(epoch + 3600),
+            "nightly-x",
+            epoch
+        ));
         // A different tag published later IS newer.
-        assert!(release_is_newer("nightly-y", Some(epoch + 3600), "nightly-x", epoch));
+        assert!(release_is_newer(
+            "nightly-y",
+            Some(epoch + 3600),
+            "nightly-x",
+            epoch
+        ));
     }
 
     #[test]
@@ -349,9 +366,16 @@ mod tests {
     #[ignore = "hits the live GitHub API"]
     fn live_fetch_latest() {
         let rel = fetch_latest().expect("fetch_latest");
-        println!("tag={} prerelease={} published={:?}", rel.tag, rel.prerelease, rel.published_at);
+        println!(
+            "tag={} prerelease={} published={:?}",
+            rel.tag, rel.prerelease, rel.published_at
+        );
         println!("asset={} url={}", rel.asset_name, rel.asset_url);
         println!("sha_url={:?}", rel.sha_url);
-        println!("this build epoch={} newer_than_this_build={}", build_epoch(), rel.is_newer_than_this_build());
+        println!(
+            "this build epoch={} newer_than_this_build={}",
+            build_epoch(),
+            rel.is_newer_than_this_build()
+        );
     }
 }

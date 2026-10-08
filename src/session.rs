@@ -160,7 +160,8 @@ impl SessionHandle {
 
     /// Update the software gain live (clamped 0..=4).
     pub fn set_gain(&self, gain: f32) {
-        self.gain.store(gain.clamp(0.0, 4.0).to_bits(), Ordering::Relaxed);
+        self.gain
+            .store(gain.clamp(0.0, 4.0).to_bits(), Ordering::Relaxed);
     }
 
     /// Live: force the wire sample rate (`None` = follow the source).
@@ -198,7 +199,9 @@ fn open_pipe(sel: &PhoneSelector) -> Result<(AoaTransport, Halves), String> {
     match sel {
         PhoneSelector::Accessory => {
             let mut t = AoaTransport::from_attached_accessory();
-            let h = t.open().map_err(|e| format!("no accessory attached: {e}"))?;
+            let h = t
+                .open()
+                .map_err(|e| format!("no accessory attached: {e}"))?;
             Ok((t, h))
         }
         PhoneSelector::Handshake { vid, pid } => {
@@ -538,13 +541,26 @@ fn run_session(
 
         // --- (Re)negotiate when idle: initial start and every resume -------------------
         if !streaming {
-            if let Some(msg) =
-                switch_source_if_needed(&source, &mut applied_source, &mut loopback, &mut follow_check)
-            {
+            if let Some(msg) = switch_source_if_needed(
+                &source,
+                &mut applied_source,
+                &mut loopback,
+                &mut follow_check,
+            ) {
                 emit(SessionEvent::State(msg));
             }
             let (wr, wd) = resolve_want(&target_rate, &target_depth, loopback.as_ref());
-            match negotiate(&mut outbound, &mut recv, &irx, &mut seq, &stop, cfg.wait_secs, wr, wd, &emit) {
+            match negotiate(
+                &mut outbound,
+                &mut recv,
+                &irx,
+                &mut seq,
+                &stop,
+                cfg.wait_secs,
+                wr,
+                wd,
+                &emit,
+            ) {
                 Ok(f) => {
                     fmt = f;
                     frames_per_msg = (fmt.sample_rate / 100).max(1);
@@ -557,7 +573,10 @@ fn run_session(
                     next_send = Instant::now();
                     emit(SessionEvent::Paused(false));
                     emit(SessionEvent::Negotiated(fmt));
-                    emit(SessionEvent::State(format!("Streaming {}", fmt.display_label())));
+                    emit(SessionEvent::State(format!(
+                        "Streaming {}",
+                        fmt.display_label()
+                    )));
                 }
                 Err(e) => {
                     emit(SessionEvent::Error(e));
@@ -592,9 +611,9 @@ fn run_session(
                     device_ms: t.device_latency_ms,
                     underruns: t.underruns,
                 }),
-                Ok(Inbound::Hello(_))
-                | Ok(Inbound::Capabilities(_))
-                | Ok(Inbound::Error(_)) => restarted = true,
+                Ok(Inbound::Hello(_)) | Ok(Inbound::Capabilities(_)) | Ok(Inbound::Error(_)) => {
+                    restarted = true
+                }
                 Ok(Inbound::AudioInfo(ai)) => emit(SessionEvent::DeviceAudio(ai)),
                 Ok(Inbound::ConfigureAck(_)) => {}
                 Err(_) => reader_dead = true,
@@ -606,13 +625,18 @@ fn run_session(
         }
         if restarted {
             streaming = false;
-            emit(SessionEvent::State("Phone reconnected — renegotiating…".into()));
+            emit(SessionEvent::State(
+                "Phone reconnected — renegotiating…".into(),
+            ));
             continue;
         }
 
-        if let Some(msg) =
-            switch_source_if_needed(&source, &mut applied_source, &mut loopback, &mut follow_check)
-        {
+        if let Some(msg) = switch_source_if_needed(
+            &source,
+            &mut applied_source,
+            &mut loopback,
+            &mut follow_check,
+        ) {
             emit(SessionEvent::State(msg));
         }
 
@@ -629,7 +653,9 @@ fn run_session(
                     .write_frame(MSG_CONFIGURE, &payload, 0, payload.len(), seq)
                     .is_err()
                 {
-                    emit(SessionEvent::Error("USB write failed (re-CONFIGURE)".into()));
+                    emit(SessionEvent::Error(
+                        "USB write failed (re-CONFIGURE)".into(),
+                    ));
                     break;
                 }
                 seq += 1;

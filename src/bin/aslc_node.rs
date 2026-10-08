@@ -544,7 +544,11 @@ fn run_receivers() {
             i,
             d.vid,
             d.pid,
-            if d.accessory { "accessory" } else { "mtp/other" },
+            if d.accessory {
+                "accessory"
+            } else {
+                "mtp/other"
+            },
             d.default_label(),
             d.serial
         );

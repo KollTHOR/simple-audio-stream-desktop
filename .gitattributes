@@ -1,0 +1,9 @@
+# Keep the driver package byte-exact across checkouts.
+#
+# The signed catalog (`platform/winusb/aslc_aoa.cat`) stores the SHA-1/SHA-256 of the INF's exact
+# bytes. With `core.autocrlf=true` a Windows checkout rewrites the INF to CRLF, so Windows then
+# rejects the package ("the hash for the file is not present in the specified catalog file").
+# Force LF for the INF and treat the catalog/cert as binary so they are never converted.
+*.inf  text eol=lf
+*.cat  -text
+*.cer  -text

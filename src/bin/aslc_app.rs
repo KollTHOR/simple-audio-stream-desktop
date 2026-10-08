@@ -94,6 +94,15 @@ enum UpdateMsg {
     Failed(String),
 }
 
+/// Top-level pages of the control window.
+#[derive(Default, PartialEq, Eq, Clone, Copy)]
+enum Tab {
+    #[default]
+    Main,
+    Settings,
+    Logs,
+}
+
 struct AslcApp {
     receivers: Vec<ReceiverDevice>,
     receiver_idx: usize,
@@ -121,6 +130,13 @@ struct AslcApp {
     update_state: UpdateState,
     update_rx: Option<std::sync::mpsc::Receiver<UpdateMsg>>,
     update_auto_checked: bool,
+
+    /// Selected page.
+    tab: Tab,
+    /// Whether an ASLC driver package is present in the driver store (`None` = checking).
+    driver_installed: Option<bool>,
+    driver_rx: Option<std::sync::mpsc::Receiver<bool>>,
+    driver_auto_checked: bool,
 
     gain: f32,
 
@@ -161,6 +177,10 @@ impl AslcApp {
             update_state: UpdateState::Idle,
             update_rx: None,
             update_auto_checked: false,
+            tab: Tab::Main,
+            driver_installed: None,
+            driver_rx: None,
+            driver_auto_checked: false,
             gain: 1.0,
             session: None,
             terminal: false,
@@ -218,7 +238,9 @@ impl AslcApp {
 
     fn refresh_receivers(&mut self) {
         self.receivers = aslc::aoa::list_receiver_devices();
-        self.receiver_idx = self.receiver_idx.min(self.receivers.len().saturating_sub(1));
+        self.receiver_idx = self
+            .receiver_idx
+            .min(self.receivers.len().saturating_sub(1));
     }
 
     fn receiver_display(&self, r: &ReceiverDevice) -> String {
@@ -316,8 +338,13 @@ impl AslcApp {
                     device_ms,
                     underruns,
                 } => {
-                    self.latency =
-                        Some((capture_ms, ring_fill_ms, ring_capacity_ms, device_ms, underruns));
+                    self.latency = Some((
+                        capture_ms,
+                        ring_fill_ms,
+                        ring_capacity_ms,
+                        device_ms,
+                        underruns,
+                    ));
                 }
                 SessionEvent::Paused(p) => self.paused = p,
                 SessionEvent::Stopped(s) => {
@@ -352,18 +379,41 @@ impl AslcApp {
         let cur_rate = self.rate_values.get(self.rate_idx).copied().flatten();
         let cur_depth = self.depth_values.get(self.depth_idx).copied().flatten();
 
-        let rate_ok = |v: &Option<u32>| v.is_none() || v.is_some_and(|r| caps.sample_rates.contains(&r));
-        self.rate_labels = RATE_CHOICES.iter().filter(|c| rate_ok(&c.1)).map(|c| c.0).collect();
-        self.rate_values = RATE_CHOICES.iter().filter(|c| rate_ok(&c.1)).map(|c| c.1).collect();
-        self.rate_idx = self.rate_values.iter().position(|v| *v == cur_rate).unwrap_or(0);
+        let rate_ok =
+            |v: &Option<u32>| v.is_none() || v.is_some_and(|r| caps.sample_rates.contains(&r));
+        self.rate_labels = RATE_CHOICES
+            .iter()
+            .filter(|c| rate_ok(&c.1))
+            .map(|c| c.0)
+            .collect();
+        self.rate_values = RATE_CHOICES
+            .iter()
+            .filter(|c| rate_ok(&c.1))
+            .map(|c| c.1)
+            .collect();
+        self.rate_idx = self
+            .rate_values
+            .iter()
+            .position(|v| *v == cur_rate)
+            .unwrap_or(0);
 
         let depth_ok =
             |v: &Option<u8>| v.is_none() || v.is_some_and(|d| caps.bit_depths.contains(&d));
-        self.depth_labels =
-            DEPTH_CHOICES.iter().filter(|c| depth_ok(&c.1)).map(|c| c.0).collect();
-        self.depth_values =
-            DEPTH_CHOICES.iter().filter(|c| depth_ok(&c.1)).map(|c| c.1).collect();
-        self.depth_idx = self.depth_values.iter().position(|v| *v == cur_depth).unwrap_or(0);
+        self.depth_labels = DEPTH_CHOICES
+            .iter()
+            .filter(|c| depth_ok(&c.1))
+            .map(|c| c.0)
+            .collect();
+        self.depth_values = DEPTH_CHOICES
+            .iter()
+            .filter(|c| depth_ok(&c.1))
+            .map(|c| c.1)
+            .collect();
+        self.depth_idx = self
+            .depth_values
+            .iter()
+            .position(|v| *v == cur_depth)
+            .unwrap_or(0);
 
         if self.rate_values.is_empty() {
             self.rate_labels = vec!["Native (follow source)"];
@@ -496,7 +546,9 @@ impl AslcApp {
                 self.update_state = UpdateState::Available(rel);
             }
             UpdateMsg::Downloaded(path) => {
-                self.push_log("Installer downloaded — launching update, the app will restart".into());
+                self.push_log(
+                    "Installer downloaded — launching update, the app will restart".into(),
+                );
                 self.update_state = UpdateState::Installing;
                 if let Err(e) = update::launch_installer(&path) {
                     self.update_state = UpdateState::Failed(e);
@@ -509,6 +561,35 @@ impl AslcApp {
                 self.push_log(format!("Update: {e}"));
                 self.update_state = UpdateState::Failed(e);
             }
+        }
+    }
+
+    // ---- USB driver presence ----------------------------------------------------------------
+
+    /// Check (in the background) whether an ASLC driver package is in the driver store.
+    fn start_driver_check(&mut self) {
+        if self.driver_rx.is_some() {
+            return;
+        }
+        self.driver_installed = None;
+        let (tx, rx) = std::sync::mpsc::channel();
+        std::thread::spawn(move || {
+            let _ = tx.send(aslc_driver_present());
+        });
+        self.driver_rx = Some(rx);
+    }
+
+    fn poll_driver(&mut self) {
+        let Some(rx) = &self.driver_rx else {
+            return;
+        };
+        match rx.try_recv() {
+            Ok(v) => {
+                self.driver_installed = Some(v);
+                self.driver_rx = None;
+            }
+            Err(std::sync::mpsc::TryRecvError::Empty) => {}
+            Err(std::sync::mpsc::TryRecvError::Disconnected) => self.driver_rx = None,
         }
     }
 
@@ -624,9 +705,14 @@ impl eframe::App for AslcApp {
         self.poll();
         self.poll_probe();
         self.poll_update();
+        self.poll_driver();
         if !self.update_auto_checked {
             self.update_auto_checked = true;
             self.start_update_check();
+        }
+        if !self.driver_auto_checked {
+            self.driver_auto_checked = true;
+            self.start_driver_check();
         }
 
         // Close → minimize (stays running in the taskbar); tray restores it.
@@ -637,9 +723,34 @@ impl eframe::App for AslcApp {
         }
 
         egui::CentralPanel::default().show(ctx, |ui| {
-            ui.heading("ASLC Node");
-            ui.label("Stream this PC's audio to the phone over USB (AOA). The PC controls the format.");
+            ui.horizontal(|ui| {
+                ui.heading("ASLC Node");
+                ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
+                    ui.selectable_value(&mut self.tab, Tab::Logs, "Logs");
+                    ui.selectable_value(&mut self.tab, Tab::Settings, "Settings");
+                    ui.selectable_value(&mut self.tab, Tab::Main, "Main");
+                });
+            });
             ui.separator();
+
+            if self.tab == Tab::Main {
+            ui.label("Stream this PC's audio to the phone over USB (AOA). The PC controls the format.");
+
+            // First-run / missing-driver notice.
+            if self.driver_installed == Some(false) {
+                ui.horizontal_wrapped(|ui| {
+                    ui.colored_label(
+                        egui::Color32::from_rgb(230, 180, 60),
+                        "⚠ The ASLC USB driver isn't installed — USB playback needs it.",
+                    );
+                    if ui.button("Install driver").clicked() {
+                        self.install_driver();
+                    }
+                    if ui.button("Details").clicked() {
+                        self.tab = Tab::Settings;
+                    }
+                });
+            }
 
             egui::Grid::new("settings")
                 .num_columns(2)
@@ -817,10 +928,26 @@ impl eframe::App for AslcApp {
                     ui.label("paused");
                 }
             });
+            } // Tab::Main
 
+            if self.tab == Tab::Settings {
             ui.separator();
+            ui.heading("USB driver (Windows)");
+            ui.label(
+                "The PC needs a WinUSB-bound interface to talk to the phone. The driver is generic \
+                 (class-based, not per-device): install it once and it covers any Android phone.",
+            );
             ui.horizontal(|ui| {
-                ui.label("USB driver (Windows):");
+                ui.label(match self.driver_installed {
+                    Some(true) => "Status: installed",
+                    Some(false) => "Status: not installed",
+                    None => "Status: checking…",
+                });
+                if ui.button("Re-check").clicked() {
+                    self.start_driver_check();
+                }
+            });
+            ui.horizontal(|ui| {
                 if ui.button("Install ASLC driver").clicked() {
                     self.install_driver();
                 }
@@ -828,8 +955,17 @@ impl eframe::App for AslcApp {
                     self.restore_mtp();
                 }
             });
+            ui.small(
+                "While installed it replaces the phone's MTP driver on this PC (file transfer stops \
+                 working) — 'Restore file transfer (MTP)' undoes it.",
+            );
+            ui.small(
+                "Phone side: set USB to 'File transfer' (MTP) once so the handshake has an interface \
+                 to use; it then switches itself to accessory mode.",
+            );
 
             ui.separator();
+            ui.heading("Updates");
             let mut do_check = false;
             let mut do_download: Option<Release> = None;
             ui.horizontal(|ui| {
@@ -883,7 +1019,9 @@ impl eframe::App for AslcApp {
             if let Some(rel) = do_download {
                 self.start_update_download(rel);
             }
+            } // Tab::Settings
 
+            if self.tab == Tab::Main {
             ui.separator();
             ui.label(format!("Status: {}", self.status));
             if let Some(f) = self.negotiated {
@@ -902,24 +1040,60 @@ impl eframe::App for AslcApp {
                 ));
                 ui.small(format!("phone buffer {ring_cap} ms · underruns {underruns}"));
             }
+            } // Tab::Main
 
-            ui.separator();
-            ui.label("Log:");
+            if self.tab == Tab::Logs {
+            ui.horizontal(|ui| {
+                ui.label("Log:");
+                if ui.button("Clear").clicked() {
+                    self.log.clear();
+                }
+            });
             egui::ScrollArea::vertical()
-                .max_height(150.0)
                 .auto_shrink([false, false])
                 .show(ui, |ui| {
                     for line in &self.log {
                         ui.small(line);
                     }
                 });
+            }
         });
 
         // Keep repainting while visible so session stats update; when hidden this stops (the tray
         // thread handles restore instead).
-        if self.session.is_some() || self.update_rx.is_some() || self.probe_rx.is_some() {
+        if self.session.is_some()
+            || self.update_rx.is_some()
+            || self.probe_rx.is_some()
+            || self.driver_rx.is_some()
+            || self.tab == Tab::Logs
+        {
             ctx.request_repaint_after(Duration::from_millis(150));
         }
+    }
+}
+
+/// True when a driver package whose original name is `aslc_aoa.inf` is present in the driver store.
+/// `pnputil /enum-drivers` works without elevation.
+fn aslc_driver_present() -> bool {
+    #[cfg(windows)]
+    {
+        use std::os::windows::process::CommandExt;
+        const CREATE_NO_WINDOW: u32 = 0x0800_0000;
+        match std::process::Command::new("pnputil")
+            .arg("/enum-drivers")
+            .creation_flags(CREATE_NO_WINDOW)
+            .output()
+        {
+            Ok(out) => {
+                let text = String::from_utf8_lossy(&out.stdout).to_ascii_lowercase();
+                text.contains("aslc_aoa.inf")
+            }
+            Err(_) => false,
+        }
+    }
+    #[cfg(not(windows))]
+    {
+        false
     }
 }
 

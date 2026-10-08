@@ -133,6 +133,8 @@ struct AslcApp {
 
     /// Selected page.
     tab: Tab,
+    /// Learned device names, keyed by USB serial (the phone reports its name in HELLO).
+    known_names: std::collections::HashMap<String, String>,
     /// Last time the receiver list was refreshed (phones can be plugged in after launch).
     last_receiver_refresh: Instant,
     /// Whether an ASLC driver package is present in the driver store (`None` = checking).
@@ -180,6 +182,7 @@ impl AslcApp {
             update_rx: None,
             update_auto_checked: false,
             tab: Tab::Main,
+            known_names: load_known_names(),
             last_receiver_refresh: Instant::now(),
             driver_installed: None,
             driver_rx: None,
@@ -278,10 +281,36 @@ impl AslcApp {
     }
 
     fn receiver_display(&self, r: &ReceiverDevice) -> String {
-        if r.accessory {
-            format!("{}  · ready", r.default_label())
+        let name = match self.known_names.get(&r.serial) {
+            Some(n) if !n.trim().is_empty() => n.clone(),
+            _ => r.default_label(),
+        };
+        let id = if r.serial.is_empty() {
+            String::new()
         } else {
-            r.default_label()
+            format!("  ·  {}", r.serial)
+        };
+        if r.accessory {
+            format!("{name}{id}  · ready")
+        } else {
+            format!("{name}{id}")
+        }
+    }
+
+    /// Remember the phone's self-reported name for the currently selected receiver (by serial) and
+    /// persist it so it shows immediately next launch.
+    fn learn_name(&mut self, name: String) {
+        let serial = match self.receivers.get(self.receiver_idx) {
+            Some(r) => r.serial.clone(),
+            None => String::new(),
+        };
+        let name = name.trim().to_string();
+        if serial.is_empty() || name.is_empty() || name == "Android" {
+            return;
+        }
+        if self.known_names.get(&serial) != Some(&name) {
+            self.known_names.insert(serial, name);
+            save_known_names(&self.known_names);
         }
     }
 
@@ -363,6 +392,10 @@ impl AslcApp {
                         ));
                     }
                     self.device_audio = Some(ai);
+                }
+                SessionEvent::DeviceName(name) => {
+                    self.push_log(format!("Phone name: {name}"));
+                    self.learn_name(name);
                 }
                 SessionEvent::Stats { kbps } => self.kbps = kbps,
                 SessionEvent::Latency {
@@ -504,6 +537,10 @@ impl AslcApp {
                         ));
                     }
                     self.device_audio = Some(ai);
+                }
+                if let Some(name) = res.device_name {
+                    self.push_log(format!("Phone name: {name}"));
+                    self.learn_name(name);
                 }
                 self.caps = Some(res.capabilities);
                 self.apply_caps();
@@ -1179,6 +1216,52 @@ fn aslc_driver_present() -> bool {
     {
         false
     }
+}
+
+/// Where learned device names live: `%LOCALAPPDATA%\ASLC Node\device-names.txt`, `serial<TAB>name`.
+fn names_file() -> Option<std::path::PathBuf> {
+    let base = std::env::var_os("LOCALAPPDATA").or_else(|| std::env::var_os("XDG_CONFIG_HOME"))?;
+    Some(
+        std::path::PathBuf::from(base)
+            .join("ASLC Node")
+            .join("device-names.txt"),
+    )
+}
+
+fn load_known_names() -> std::collections::HashMap<String, String> {
+    let mut map = std::collections::HashMap::new();
+    let Some(path) = names_file() else {
+        return map;
+    };
+    let Ok(text) = std::fs::read_to_string(&path) else {
+        return map;
+    };
+    for line in text.lines() {
+        if let Some((serial, name)) = line.split_once('\t') {
+            let (serial, name) = (serial.trim(), name.trim());
+            if !serial.is_empty() && !name.is_empty() {
+                map.insert(serial.to_string(), name.to_string());
+            }
+        }
+    }
+    map
+}
+
+fn save_known_names(map: &std::collections::HashMap<String, String>) {
+    let Some(path) = names_file() else {
+        return;
+    };
+    if let Some(dir) = path.parent() {
+        let _ = std::fs::create_dir_all(dir);
+    }
+    let mut text = String::new();
+    for (serial, name) in map {
+        text.push_str(serial);
+        text.push('\t');
+        text.push_str(name);
+        text.push('\n');
+    }
+    let _ = std::fs::write(&path, text);
 }
 
 /// Handle tray events on a dedicated thread. While the window is hidden eframe does not run

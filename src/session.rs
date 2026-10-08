@@ -82,6 +82,8 @@ pub enum SessionEvent {
     Capabilities(PcmCapabilities),
     /// The device's audio-output characteristics (native output rate/buffer), from `AUDIO_INFO`.
     DeviceAudio(AudioInfo),
+    /// The device's self-reported display name (from its `HELLO`), if non-empty.
+    DeviceName(String),
     /// Streaming paused (true) or resumed (false).
     Paused(bool),
     /// Rolling throughput (kbit/s).
@@ -218,6 +220,8 @@ fn open_pipe(sel: &PhoneSelector) -> Result<(AoaTransport, Halves), String> {
 pub struct ProbeResult {
     pub capabilities: PcmCapabilities,
     pub audio_info: Option<AudioInfo>,
+    /// The device's self-reported display name (from its `HELLO`), if non-empty.
+    pub device_name: Option<String>,
 }
 
 /// Read-only probe: open the AOA pipe, greet the phone, and collect its `CAPABILITIES` (and a
@@ -255,6 +259,7 @@ pub fn probe_capabilities(cfg: &SessionConfig) -> Result<ProbeResult, String> {
     let deadline = Instant::now() + Duration::from_secs(cfg.wait_secs.max(1));
     let mut caps: Option<PcmCapabilities> = None;
     let mut audio_info: Option<AudioInfo> = None;
+    let mut device_name: Option<String> = None;
     let mut caps_at: Option<Instant> = None;
     loop {
         if Instant::now() >= deadline {
@@ -270,6 +275,12 @@ pub fn probe_capabilities(cfg: &SessionConfig) -> Result<ProbeResult, String> {
                 caps_at = Some(Instant::now());
             }
             Ok(Ok(Inbound::AudioInfo(ai))) => audio_info = Some(ai),
+            Ok(Ok(Inbound::Hello(h))) => {
+                let n = h.role_tag.trim();
+                if !n.is_empty() {
+                    device_name = Some(n.to_string());
+                }
+            }
             Ok(Ok(_)) => {}
             Ok(Err(_)) => break,
             Err(RecvTimeoutError::Timeout) => {}
@@ -281,6 +292,7 @@ pub fn probe_capabilities(cfg: &SessionConfig) -> Result<ProbeResult, String> {
         Some(capabilities) => Ok(ProbeResult {
             capabilities,
             audio_info,
+            device_name,
         }),
         None => Err("no capabilities from the phone — open the app and enable USB Receive".into()),
     }
@@ -411,6 +423,12 @@ fn negotiate(
         }
         match irx.recv_timeout(Duration::from_millis(150)) {
             Ok(Ok(m)) => {
+                if let Inbound::Hello(h) = &m {
+                    let n = h.role_tag.trim();
+                    if !n.is_empty() {
+                        emit(SessionEvent::DeviceName(n.to_string()));
+                    }
+                }
                 if let Inbound::AudioInfo(ai) = &m {
                     emit(SessionEvent::DeviceAudio(*ai));
                 }
@@ -611,9 +629,14 @@ fn run_session(
                     device_ms: t.device_latency_ms,
                     underruns: t.underruns,
                 }),
-                Ok(Inbound::Hello(_)) | Ok(Inbound::Capabilities(_)) | Ok(Inbound::Error(_)) => {
+                Ok(Inbound::Hello(h)) => {
+                    let n = h.role_tag.trim();
+                    if !n.is_empty() {
+                        emit(SessionEvent::DeviceName(n.to_string()));
+                    }
                     restarted = true
                 }
+                Ok(Inbound::Capabilities(_)) | Ok(Inbound::Error(_)) => restarted = true,
                 Ok(Inbound::AudioInfo(ai)) => emit(SessionEvent::DeviceAudio(ai)),
                 Ok(Inbound::ConfigureAck(_)) => {}
                 Err(_) => reader_dead = true,

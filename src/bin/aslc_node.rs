@@ -606,6 +606,7 @@ fn run_session_cmd(args: Vec<String>) {
                     "[audio] phone output: {} Hz · {} frames/buffer",
                     ai.output_sample_rate, ai.output_frames_per_buffer
                 ),
+                aslc::SessionEvent::DeviceName(name) => println!("[name] {name}"),
                 aslc::SessionEvent::Paused(p) => println!("[paused] {p}"),
                 aslc::SessionEvent::Stats { kbps } => println!("[stats] {kbps:.0} kbit/s"),
                 aslc::SessionEvent::Latency {

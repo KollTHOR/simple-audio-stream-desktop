@@ -7,7 +7,10 @@
 ;        3) ISCC installer\aslc-node.iss   (Inno Setup 6)
 
 #define MyAppName "ASLC Node"
-#define MyAppVersion "0.1.0"
+; MyAppVersion is injected by CI via ISCC /DMyAppVersion=... ; the default is the crate version.
+#ifndef MyAppVersion
+  #define MyAppVersion "0.1.0"
+#endif
 #define MyAppPublisher "Simple Audio Stream"
 
 [Setup]
@@ -62,7 +65,18 @@ Filename: "{sys}\pnputil.exe"; Parameters: "/add-driver ""{app}\driver\aslc_aoa.
 Filename: "{sys}\pnputil.exe"; Parameters: "/scan-devices"; Flags: runhidden; StatusMsg: "Rescanning USB devices..."
 ; 4) Offer to launch the control window.
 Filename: "{app}\aslc_app.exe"; Description: "Launch ASLC Node"; Flags: nowait postinstall skipifsilent
+; 5) When invoked by the in-app updater (/ASLCUPDATE=1), relaunch automatically after the silent
+;    install (the postinstall entry above is skipped in silent mode).
+Filename: "{app}\aslc_app.exe"; Flags: nowait runasoriginaluser; Check: LaunchAfterUpdate
 
 [UninstallRun]
 ; Remove driver package (by original file name) and the trust certs, so nothing is left behind.
 Filename: "powershell.exe"; Parameters: "-NoProfile -ExecutionPolicy Bypass -File ""{tmp}\uninstall-driver.ps1"""; Flags: runhidden; RunOnceId: "DelAslcDriver"
+
+[Code]
+{ True when the installer was launched by the in-app updater, which asks for the app to be
+  relaunched once the silent install finishes. }
+function LaunchAfterUpdate(): Boolean;
+begin
+  Result := ExpandConstant('{param:ASLCUPDATE|0}') = '1';
+end;

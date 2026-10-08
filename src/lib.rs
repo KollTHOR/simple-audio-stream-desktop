@@ -21,6 +21,7 @@ pub mod payload;
 pub mod receiver;
 pub mod session;
 pub mod transport;
+pub mod update;
 
 pub use aoa::AoaTransport;
 pub use capabilities::PcmCapabilities;

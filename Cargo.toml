@@ -46,3 +46,11 @@ raw-window-handle = "0.6"
 wasapi = "0.25"
 # Read the device's MTP/WPD friendly name from the registry (USB descriptors are board strings).
 winreg = "0.56"
+
+# In-app updater: JSON parsing for the GitHub releases API; the HTTP transfer uses the OS `curl`
+# (no TLS stack pulled in). SHA-256 verifies the downloaded installer.
+[dependencies.serde_json]
+version = "1"
+
+[dependencies.sha2]
+version = "0.10"

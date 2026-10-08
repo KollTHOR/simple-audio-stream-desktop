@@ -29,6 +29,7 @@ use aslc::payload::AudioInfo;
 use aslc::session::{
     probe_capabilities, PhoneSelector, ProbeResult, SessionConfig, SessionEvent, SessionHandle,
 };
+use aslc::update::{self, Release};
 use aslc::{capabilities::PcmCapabilities, PcmFormat};
 
 fn main() -> eframe::Result<()> {
@@ -72,6 +73,27 @@ const DEPTH_CHOICES: [(&str, Option<u8>); 4] = [
     ("32-bit", Some(32)),
 ];
 
+/// In-app updater state (rendered under the transport controls).
+#[derive(Default)]
+enum UpdateState {
+    #[default]
+    Idle,
+    Checking,
+    UpToDate,
+    Available(Release),
+    Downloading,
+    Installing,
+    Failed(String),
+}
+
+/// Messages from the updater worker thread.
+enum UpdateMsg {
+    UpToDate,
+    Available(Release),
+    Downloaded(std::path::PathBuf),
+    Failed(String),
+}
+
 struct AslcApp {
     receivers: Vec<ReceiverDevice>,
     receiver_idx: usize,
@@ -94,6 +116,11 @@ struct AslcApp {
     device_audio: Option<AudioInfo>,
     /// In-flight pre-start capability probe result, if any.
     probe_rx: Option<std::sync::mpsc::Receiver<Result<ProbeResult, String>>>,
+
+    /// In-app updater: state + the in-flight check/download worker channel.
+    update_state: UpdateState,
+    update_rx: Option<std::sync::mpsc::Receiver<UpdateMsg>>,
+    update_auto_checked: bool,
 
     gain: f32,
 
@@ -131,6 +158,9 @@ impl AslcApp {
             caps: None,
             device_audio: None,
             probe_rx: None,
+            update_state: UpdateState::Idle,
+            update_rx: None,
+            update_auto_checked: false,
             gain: 1.0,
             session: None,
             terminal: false,
@@ -404,6 +434,84 @@ impl AslcApp {
         }
     }
 
+    // ---- In-app updater ---------------------------------------------------------------------
+
+    /// Query GitHub for the newest release in the background and see if it is newer than this build.
+    fn start_update_check(&mut self) {
+        if self.update_rx.is_some() {
+            return;
+        }
+        self.update_state = UpdateState::Checking;
+        let (tx, rx) = std::sync::mpsc::channel();
+        std::thread::spawn(move || {
+            let msg = match update::fetch_latest() {
+                Ok(rel) if rel.is_newer_than_this_build() => UpdateMsg::Available(rel),
+                Ok(_) => UpdateMsg::UpToDate,
+                Err(e) => UpdateMsg::Failed(e),
+            };
+            let _ = tx.send(msg);
+        });
+        self.update_rx = Some(rx);
+    }
+
+    /// Download the release's installer in the background.
+    fn start_update_download(&mut self, rel: Release) {
+        if self.update_rx.is_some() {
+            return;
+        }
+        self.update_state = UpdateState::Downloading;
+        let (tx, rx) = std::sync::mpsc::channel();
+        std::thread::spawn(move || {
+            let msg = match update::download(&rel) {
+                Ok(path) => UpdateMsg::Downloaded(path),
+                Err(e) => UpdateMsg::Failed(e),
+            };
+            let _ = tx.send(msg);
+        });
+        self.update_rx = Some(rx);
+    }
+
+    /// Drain updater worker messages each frame.
+    fn poll_update(&mut self) {
+        let Some(rx) = &self.update_rx else {
+            return;
+        };
+        let msg = match rx.try_recv() {
+            Ok(m) => m,
+            Err(std::sync::mpsc::TryRecvError::Empty) => return,
+            Err(std::sync::mpsc::TryRecvError::Disconnected) => {
+                self.update_rx = None;
+                self.update_state = UpdateState::Idle;
+                return;
+            }
+        };
+        self.update_rx = None;
+        match msg {
+            UpdateMsg::UpToDate => {
+                self.push_log("Up to date".into());
+                self.update_state = UpdateState::UpToDate;
+            }
+            UpdateMsg::Available(rel) => {
+                self.push_log(format!("Update available: {}", rel.tag));
+                self.update_state = UpdateState::Available(rel);
+            }
+            UpdateMsg::Downloaded(path) => {
+                self.push_log("Installer downloaded — launching update, the app will restart".into());
+                self.update_state = UpdateState::Installing;
+                if let Err(e) = update::launch_installer(&path) {
+                    self.update_state = UpdateState::Failed(e);
+                } else {
+                    // The installer replaces our binaries; exit so it can.
+                    std::process::exit(0);
+                }
+            }
+            UpdateMsg::Failed(e) => {
+                self.push_log(format!("Update: {e}"));
+                self.update_state = UpdateState::Failed(e);
+            }
+        }
+    }
+
     fn start(&mut self) {
         let phone = self.selected_selector();
         let device = self
@@ -515,6 +623,11 @@ impl eframe::App for AslcApp {
 
         self.poll();
         self.poll_probe();
+        self.poll_update();
+        if !self.update_auto_checked {
+            self.update_auto_checked = true;
+            self.start_update_check();
+        }
 
         // Close → minimize (stays running in the taskbar); tray restores it.
         if ctx.input(|i| i.viewport().close_requested()) {
@@ -717,6 +830,61 @@ impl eframe::App for AslcApp {
             });
 
             ui.separator();
+            let mut do_check = false;
+            let mut do_download: Option<Release> = None;
+            ui.horizontal(|ui| {
+                ui.label(format!(
+                    "ASLC Node {} · {}",
+                    update::version(),
+                    update::git_sha()
+                ));
+                ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
+                    if ui.button("Check for updates").clicked() {
+                        do_check = true;
+                    }
+                });
+            });
+            match &self.update_state {
+                UpdateState::Idle => {}
+                UpdateState::Checking => {
+                    ui.label("Checking for updates…");
+                }
+                UpdateState::UpToDate => {
+                    ui.label("Up to date.");
+                }
+                UpdateState::Downloading => {
+                    ui.label("Downloading the installer…");
+                }
+                UpdateState::Installing => {
+                    ui.label("Launching the installer — the app will restart…");
+                }
+                UpdateState::Failed(e) => {
+                    ui.colored_label(
+                        egui::Color32::from_rgb(220, 130, 90),
+                        format!("Update failed: {e}"),
+                    );
+                }
+                UpdateState::Available(rel) => {
+                    let kind = if rel.prerelease { "nightly" } else { "release" };
+                    ui.horizontal(|ui| {
+                        ui.colored_label(
+                            egui::Color32::from_rgb(90, 170, 230),
+                            format!("Update available: {} ({kind})", rel.tag),
+                        );
+                        if ui.button("Download & install").clicked() {
+                            do_download = Some(rel.clone());
+                        }
+                    });
+                }
+            }
+            if do_check {
+                self.start_update_check();
+            }
+            if let Some(rel) = do_download {
+                self.start_update_download(rel);
+            }
+
+            ui.separator();
             ui.label(format!("Status: {}", self.status));
             if let Some(f) = self.negotiated {
                 ui.label(format!("Format: {}", f.display_label()));
@@ -749,7 +917,7 @@ impl eframe::App for AslcApp {
 
         // Keep repainting while visible so session stats update; when hidden this stops (the tray
         // thread handles restore instead).
-        if self.session.is_some() {
+        if self.session.is_some() || self.update_rx.is_some() || self.probe_rx.is_some() {
             ctx.request_repaint_after(Duration::from_millis(150));
         }
     }

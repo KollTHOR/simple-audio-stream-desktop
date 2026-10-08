@@ -538,6 +538,9 @@ fn run_session(
     let mut last_stat = Instant::now();
     let mut last_messages: u64 = 0;
     let mut messages: u64 = 0;
+    // Set when the phone stopped its USB input / the pipe closed, so the terminal event reads as a
+    // clean stop rather than a generic "stopped after N messages".
+    let mut stopped_by_device = false;
 
     loop {
         if stop.load(Ordering::SeqCst) {
@@ -643,7 +646,8 @@ fn run_session(
             }
         }
         if reader_dead {
-            emit(SessionEvent::Error("device disconnected".into()));
+            // The phone stopped its USB input (or the pipe closed): a clean stop, not an error.
+            stopped_by_device = true;
             break;
         }
         if restarted {
@@ -796,9 +800,11 @@ fn run_session(
     }
     transport.close();
     emit(SessionEvent::Paused(false));
-    emit(SessionEvent::Stopped(format!(
-        "stopped after {messages} messages"
-    )));
+    emit(SessionEvent::Stopped(if stopped_by_device {
+        "phone stopped the USB input".into()
+    } else {
+        format!("stopped after {messages} messages")
+    }));
 }
 
 /// Fill `pcm` with a continuous-phase 440 Hz test tone (mono duplicated), scaled by `gain`.

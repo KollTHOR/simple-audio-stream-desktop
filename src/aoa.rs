@@ -20,7 +20,9 @@ use std::task::{Poll, Waker};
 use std::time::{Duration, Instant};
 
 use futures_lite::future::block_on;
-use nusb::transfer::{Control, ControlType, Direction, EndpointType, Queue, Recipient, RequestBuffer};
+use nusb::transfer::{
+    Control, ControlType, Direction, EndpointType, Queue, Recipient, RequestBuffer,
+};
 use nusb::{Device, DeviceInfo, Interface};
 
 use crate::frame::AslcError;
@@ -228,7 +230,9 @@ fn registry_device_name(vid: u16, pid: Option<u16>) -> Option<String> {
     for key_name in usb.enum_keys().flatten() {
         let matches = match &exact {
             Some(want) => &key_name == want,
-            None => key_name.starts_with(&format!("VID_{vid:04X}&PID_")) && key_name.ends_with("&MI_00"),
+            None => {
+                key_name.starts_with(&format!("VID_{vid:04X}&PID_")) && key_name.ends_with("&MI_00")
+            }
         };
         if !matches {
             continue;
@@ -270,7 +274,8 @@ fn wpd_names() -> Vec<(String, String)> {
     use winreg::RegKey;
 
     let hklm = RegKey::predef(HKEY_LOCAL_MACHINE);
-    let Ok(root) = hklm.open_subkey("SOFTWARE\\Microsoft\\Windows Portable Devices\\Devices") else {
+    let Ok(root) = hklm.open_subkey("SOFTWARE\\Microsoft\\Windows Portable Devices\\Devices")
+    else {
         return Vec::new();
     };
     let mut out = Vec::new();
@@ -848,5 +853,18 @@ mod tests {
     fn list_devices_is_safe_without_a_phone() {
         // Enumeration must not panic with no accessory present; any device count is fine.
         let _ = nusb::list_devices().map(|it| it.count()).unwrap_or(0);
+    }
+
+    /// Manual: print the receivers the app would offer.
+    /// `cargo test --lib -- --ignored live_list_receivers --nocapture`
+    #[test]
+    #[ignore = "needs a phone attached"]
+    fn live_list_receivers() {
+        for r in list_receiver_devices() {
+            println!(
+                "{:04x}:{:04x} accessory={} name={:?} serial={:?}",
+                r.vid, r.pid, r.accessory, r.name, r.serial
+            );
+        }
     }
 }

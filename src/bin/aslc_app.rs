@@ -15,7 +15,7 @@
 
 use std::sync::atomic::{AtomicBool, AtomicIsize, Ordering};
 use std::sync::Arc;
-use std::time::Duration;
+use std::time::{Duration, Instant};
 
 use eframe::egui;
 use raw_window_handle::{HasWindowHandle, RawWindowHandle};
@@ -133,6 +133,8 @@ struct AslcApp {
 
     /// Selected page.
     tab: Tab,
+    /// Last time the receiver list was refreshed (phones can be plugged in after launch).
+    last_receiver_refresh: Instant,
     /// Whether an ASLC driver package is present in the driver store (`None` = checking).
     driver_installed: Option<bool>,
     driver_rx: Option<std::sync::mpsc::Receiver<bool>>,
@@ -178,6 +180,7 @@ impl AslcApp {
             update_rx: None,
             update_auto_checked: false,
             tab: Tab::Main,
+            last_receiver_refresh: Instant::now(),
             driver_installed: None,
             driver_rx: None,
             driver_auto_checked: false,
@@ -237,10 +240,20 @@ impl AslcApp {
     }
 
     fn refresh_receivers(&mut self) {
+        let prev = self
+            .receivers
+            .get(self.receiver_idx)
+            .map(|r| (r.vid, r.pid));
         self.receivers = aslc::aoa::list_receiver_devices();
-        self.receiver_idx = self
-            .receiver_idx
-            .min(self.receivers.len().saturating_sub(1));
+        // The list is re-sorted (accessories first), so keep the user's pick by identity.
+        self.receiver_idx = match prev {
+            Some((vid, pid)) => self
+                .receivers
+                .iter()
+                .position(|r| r.vid == vid && r.pid == pid)
+                .unwrap_or(0),
+            None => 0,
+        };
     }
 
     fn receiver_display(&self, r: &ReceiverDevice) -> String {
@@ -594,6 +607,16 @@ impl AslcApp {
     }
 
     fn start(&mut self) {
+        self.refresh_receivers();
+        if self.receivers.is_empty() {
+            self.status = "No phone detected".into();
+            self.push_log(
+                "No phone found. Set the phone's USB mode to 'File transfer' (MTP), plug it in, \
+                 then try again."
+                    .into(),
+            );
+            return;
+        }
         let phone = self.selected_selector();
         let device = self
             .devices
@@ -700,6 +723,12 @@ impl eframe::App for AslcApp {
         }
         if self.want_stop.swap(false, Ordering::SeqCst) && self.running() && !self.paused {
             self.pause();
+        }
+
+        // Phones can be plugged in (or switched to MTP) after launch: keep the list fresh.
+        if self.last_receiver_refresh.elapsed() >= Duration::from_secs(2) {
+            self.last_receiver_refresh = Instant::now();
+            self.refresh_receivers();
         }
 
         self.poll();
@@ -1061,14 +1090,13 @@ impl eframe::App for AslcApp {
 
         // Keep repainting while visible so session stats update; when hidden this stops (the tray
         // thread handles restore instead).
-        if self.session.is_some()
+        let busy = self.session.is_some()
             || self.update_rx.is_some()
             || self.probe_rx.is_some()
             || self.driver_rx.is_some()
-            || self.tab == Tab::Logs
-        {
-            ctx.request_repaint_after(Duration::from_millis(150));
-        }
+            || self.tab == Tab::Logs;
+        // Always wake periodically so the receiver list stays current and the window stays live.
+        ctx.request_repaint_after(Duration::from_millis(if busy { 150 } else { 2000 }));
     }
 }
 

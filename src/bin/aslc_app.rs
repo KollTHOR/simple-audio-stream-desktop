@@ -287,20 +287,47 @@ impl AslcApp {
     }
 
     fn refresh_receivers(&mut self) {
-        let prev = self
+        // Preserve the user's pick across a refresh. Identity must survive the AOA flip, which
+        // changes the device's VID:PID (MTP door -> 18d1:2dxx), so prefer the serial, then the name,
+        // and only then the VID:PID.
+        let prev_serial = self
+            .receivers
+            .get(self.receiver_idx)
+            .map(|r| r.serial.clone())
+            .filter(|s| !s.is_empty());
+        let prev_name = self
+            .receivers
+            .get(self.receiver_idx)
+            .map(|r| r.name.clone())
+            .filter(|n| !n.trim().is_empty());
+        let prev_pair = self
             .receivers
             .get(self.receiver_idx)
             .map(|r| (r.vid, r.pid));
+
         self.receivers = aslc::aoa::list_receiver_devices();
-        // The list is re-sorted (accessories first), so keep the user's pick by identity.
-        self.receiver_idx = match prev {
-            Some((vid, pid)) => self
-                .receivers
-                .iter()
-                .position(|r| r.vid == vid && r.pid == pid)
-                .unwrap_or(0),
-            None => 0,
-        };
+
+        self.receiver_idx = prev_serial
+            .and_then(|s| {
+                self.receivers
+                    .iter()
+                    .position(|r| !r.serial.is_empty() && r.serial == s)
+            })
+            .or_else(|| {
+                prev_name.and_then(|n| {
+                    self.receivers
+                        .iter()
+                        .position(|r| r.name.trim() == n.trim())
+                })
+            })
+            .or_else(|| {
+                prev_pair.and_then(|(vid, pid)| {
+                    self.receivers
+                        .iter()
+                        .position(|r| r.vid == vid && r.pid == pid)
+                })
+            })
+            .unwrap_or(0);
     }
 
     /// Remember the phone's self-reported name for the currently selected receiver (by serial) and
@@ -507,6 +534,13 @@ impl AslcApp {
         if self.running() {
             return;
         }
+        // Never handshake merely to probe: that flips the phone into accessory mode as a side effect
+        // of plugging it in (and then times out if the phone app isn't ready). Only probe a phone
+        // that is already an accessory; otherwise the capabilities are learned from the first real
+        // Start.
+        if !matches!(self.selected_selector(), PhoneSelector::Accessory) {
+            return;
+        }
         let cfg = SessionConfig {
             phone: self.selected_selector(),
             device: None,
@@ -710,7 +744,7 @@ impl AslcApp {
             target_depth,
             gain: self.gain,
             tone: false,
-            wait_secs: 30,
+            wait_secs: 90,
         };
         self.status = "Starting…".into();
         self.error = None;

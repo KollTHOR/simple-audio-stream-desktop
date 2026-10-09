@@ -528,6 +528,9 @@ pub struct AoaTransport {
     /// Cancellation for the bulk-IN reader, so a terminated session releases the interface.
     reader_cancel: Option<Arc<AtomicBool>>,
     reader_waker: Option<Arc<Mutex<Option<Waker>>>>,
+    /// External cancellation (the session's stop flag) so the accessory wait can be aborted by the
+    /// user pressing Stop.
+    cancel: Option<Arc<AtomicBool>>,
 }
 
 impl AoaTransport {
@@ -539,6 +542,7 @@ impl AoaTransport {
             keepalive: None,
             reader_cancel: None,
             reader_waker: None,
+            cancel: None,
         }
     }
 
@@ -549,7 +553,14 @@ impl AoaTransport {
             keepalive: None,
             reader_cancel: None,
             reader_waker: None,
+            cancel: None,
         }
+    }
+
+    /// Install an external cancel flag (the session's stop flag) so `open` — including the long
+    /// accessory wait — can be aborted from the UI.
+    pub fn set_cancel(&mut self, cancel: Arc<AtomicBool>) {
+        self.cancel = Some(cancel);
     }
 
     /// Cancel the bulk-IN reader, unblocking it so it exits and drops its interface reference.
@@ -614,12 +625,20 @@ impl AoaTransport {
 
     /// Waits for the phone to re-enumerate as an accessory after START, then opens + claims its bulk
     /// interface. Windows PnP can take several seconds to settle a re-enumerated composite, so this
-    /// polls patiently and reports progress.
+    /// polls patiently and reports progress. The window is generous (the user may be answering the
+    /// phone's USB-access dialog) and cancelable from the UI.
     fn wait_for_accessory(&mut self) -> Result<(Interface, u8, u8), AslcError> {
-        let deadline = Instant::now() + Duration::from_secs(20);
+        let deadline = Instant::now() + Duration::from_secs(90);
         let mut announced = false;
         let mut last_err: Option<String> = None;
         loop {
+            if self
+                .cancel
+                .as_ref()
+                .is_some_and(|c| c.load(Ordering::SeqCst))
+            {
+                return Err(io_other("cancelled"));
+            }
             if let Some(dev) = Self::find_device(is_accessory_device) {
                 if !announced {
                     eprintln!(

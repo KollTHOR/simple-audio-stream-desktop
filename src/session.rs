@@ -197,21 +197,22 @@ impl SessionHandle {
     }
 }
 
-fn open_pipe(sel: &PhoneSelector) -> Result<(AoaTransport, Halves), String> {
-    match sel {
-        PhoneSelector::Accessory => {
-            let mut t = AoaTransport::from_attached_accessory();
-            let h = t
-                .open()
-                .map_err(|e| format!("no accessory attached: {e}"))?;
-            Ok((t, h))
-        }
-        PhoneSelector::Handshake { vid, pid } => {
-            let mut t = AoaTransport::new(*vid, *pid);
-            let h = t.open().map_err(|e| format!("AOA handshake failed: {e}"))?;
-            Ok((t, h))
-        }
+fn open_pipe(
+    sel: &PhoneSelector,
+    cancel: Option<Arc<AtomicBool>>,
+) -> Result<(AoaTransport, Halves), String> {
+    let mut t = match sel {
+        PhoneSelector::Accessory => AoaTransport::from_attached_accessory(),
+        PhoneSelector::Handshake { vid, pid } => AoaTransport::new(*vid, *pid),
+    };
+    if let Some(c) = cancel {
+        t.set_cancel(c);
     }
+    let h = t.open().map_err(|e| match sel {
+        PhoneSelector::Accessory => format!("no accessory attached: {e}"),
+        PhoneSelector::Handshake { .. } => format!("AOA handshake failed: {e}"),
+    })?;
+    Ok((t, h))
 }
 
 /// The result of a read-only capability probe: what the phone offers plus its audio-output
@@ -228,7 +229,7 @@ pub struct ProbeResult {
 /// trailing `AUDIO_INFO`) without configuring or starting a stream. Lets the GUI constrain its
 /// rate/depth menus before the first Start.
 pub fn probe_capabilities(cfg: &SessionConfig) -> Result<ProbeResult, String> {
-    let (mut transport, (reader, writer)) = open_pipe(&cfg.phone)?;
+    let (mut transport, (reader, writer)) = open_pipe(&cfg.phone, None)?;
 
     let (itx, irx) = channel::<Result<Inbound, String>>();
     std::thread::Builder::new()
@@ -413,6 +414,10 @@ fn negotiate(
         .map_err(|e| format!("USB write failed (HELLO): {e}"))?;
     *seq += 1;
 
+    emit(SessionEvent::State(
+        "Waiting for the phone — allow USB access if asked".into(),
+    ));
+
     let deadline = Instant::now() + Duration::from_secs(wait_secs.max(1));
     loop {
         if stop.load(Ordering::SeqCst) {
@@ -477,11 +482,17 @@ fn run_session(
         let _ = tx.send(e);
     };
 
-    emit(SessionEvent::State("Opening USB pipe…".into()));
-    let (mut transport, halves) = match open_pipe(&cfg.phone) {
+    emit(SessionEvent::State(
+        "Connecting to your phone — allow USB access on the phone if asked…".into(),
+    ));
+    let (mut transport, halves) = match open_pipe(&cfg.phone, Some(stop.clone())) {
         Ok(v) => v,
         Err(e) => {
-            emit(SessionEvent::Error(e));
+            if stop.load(Ordering::SeqCst) {
+                emit(SessionEvent::Stopped("stopped".into()));
+            } else {
+                emit(SessionEvent::Error(e));
+            }
             return;
         }
     };
